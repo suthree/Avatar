@@ -87,6 +87,15 @@ pip install requests streamlit pywebview
 cp mykey_template.py mykey.py
 # Edit mykey.py and fill in your LLM API Key
 
+# Alternative: use environment variables
+# export JARVIS_APIKEY='sk-...'
+# export JARVIS_APIBASE='https://api.openai.com/v1'
+# export JARVIS_MODEL='gpt-5.4'
+
+# Alternative: use TOML config
+# cp mykey.toml.example mykey.toml
+# Edit mykey.toml and fill in your LLM API Key
+
 # 4. Launch
 python launch.pyw
 ```

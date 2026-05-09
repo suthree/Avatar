@@ -28,6 +28,9 @@ model_responses.txt
 
 # Sensitive files (API keys, credentials)
 mykey.py
+mykey.toml
+.env
+.env.*
 
 tasks/
 

@@ -2,23 +2,112 @@ import os, json, re, time, requests, sys, threading, urllib3, base64, importlib,
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4())
+try: import tomllib
+except Exception:
+    try: import tomli as tomllib
+    except Exception: tomllib = None
+
+_ENV_CFG_KEYS = [
+    'JARVIS_MYKEY_JSON', 'JARVIS_APIKEY', 'JARVIS_APIBASE', 'JARVIS_MODEL', 'JARVIS_NAME',
+    'JARVIS_API_MODE', 'JARVIS_MAX_RETRIES', 'JARVIS_CONNECT_TIMEOUT', 'JARVIS_READ_TIMEOUT',
+    'JARVIS_CONTEXT_WIN', 'JARVIS_MAX_TOKENS', 'JARVIS_TEMPERATURE', 'JARVIS_PROXY',
+    'JARVIS_REASONING_EFFORT', 'JARVIS_THINKING_TYPE', 'JARVIS_THINKING_BUDGET_TOKENS',
+    'JARVIS_STREAM', 'JARVIS_CONFIG_TOML'
+]
+
+def _coerce_env_value(v):
+    if not isinstance(v, str): return v
+    s = v.strip()
+    if not s: return s
+    if s.lower() in ('true', 'false'): return s.lower() == 'true'
+    try: return json.loads(s)
+    except Exception: return s
+
+def _load_mykeys_from_env():
+    raw = os.environ.get('JARVIS_MYKEY_JSON', '').strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            raise Exception(f'[ERROR] Invalid JARVIS_MYKEY_JSON: {e}')
+        if not isinstance(data, dict):
+            raise Exception('[ERROR] JARVIS_MYKEY_JSON must be a JSON object.')
+        return data
+    apikey = os.environ.get('JARVIS_APIKEY', '').strip()
+    if not apikey: return None
+    name = os.environ.get('JARVIS_NAME', 'gpt-native').strip() or 'gpt-native'
+    cfg = {
+        'name': name,
+        'apikey': apikey,
+        'apibase': os.environ.get('JARVIS_APIBASE', 'https://api.openai.com/v1').strip() or 'https://api.openai.com/v1',
+        'model': os.environ.get('JARVIS_MODEL', 'gpt-5.4').strip() or 'gpt-5.4',
+        'api_mode': os.environ.get('JARVIS_API_MODE', 'chat_completions').strip() or 'chat_completions',
+    }
+    for env_k, cfg_k in [
+        ('JARVIS_MAX_RETRIES', 'max_retries'),
+        ('JARVIS_CONNECT_TIMEOUT', 'connect_timeout'),
+        ('JARVIS_READ_TIMEOUT', 'read_timeout'),
+        ('JARVIS_CONTEXT_WIN', 'context_win'),
+        ('JARVIS_MAX_TOKENS', 'max_tokens'),
+        ('JARVIS_TEMPERATURE', 'temperature'),
+        ('JARVIS_PROXY', 'proxy'),
+        ('JARVIS_REASONING_EFFORT', 'reasoning_effort'),
+        ('JARVIS_THINKING_TYPE', 'thinking_type'),
+        ('JARVIS_THINKING_BUDGET_TOKENS', 'thinking_budget_tokens'),
+        ('JARVIS_STREAM', 'stream'),
+    ]:
+        if env_k in os.environ and os.environ[env_k].strip() != '': cfg[cfg_k] = _coerce_env_value(os.environ[env_k])
+    out = {'native_oai_config': cfg}
+    if os.environ.get('JARVIS_ENABLE_MIXIN', '1').strip().lower() not in ('0', 'false', 'no'):
+        out['mixin_config'] = {'llm_nos': [name], 'max_retries': int(_coerce_env_value(os.environ.get('JARVIS_MIXIN_MAX_RETRIES', '2'))), 'base_delay': float(_coerce_env_value(os.environ.get('JARVIS_MIXIN_BASE_DELAY', '0.5')))}
+    return out
+
 
 def _load_mykeys():
     global _mykey_path
+    env_cfg = _load_mykeys_from_env()
+    if env_cfg is not None:
+        _mykey_path = '[env:JARVIS_*]'
+        return env_cfg
     try:
         import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
         return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
     except ImportError: pass
-    _mykey_path = p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
-    if not os.path.exists(p): raise Exception('[ERROR] mykey.py or mykey.json not found, please create one from mykey_template.')
+    root = os.path.dirname(os.path.abspath(__file__))
+    p = os.environ.get('JARVIS_CONFIG_TOML', '').strip() or os.path.join(root, 'mykey.toml')
+    if os.path.exists(p):
+        if tomllib is None: raise Exception('[ERROR] tomllib/tomli unavailable, cannot load mykey.toml')
+        _mykey_path = p
+        with open(p, 'rb') as f: return tomllib.load(f)
+    _mykey_path = p = os.path.join(root, 'mykey.json')
+    if not os.path.exists(p): raise Exception('[ERROR] No config found. Supported: env JARVIS_*, mykey.py, mykey.toml, mykey.json')
     with open(p, encoding='utf-8') as f: return json.load(f)
 
-_mykey_path = _mykey_mtime = None
+_mykey_path = _mykey_mtime = _mykey_sig = None
+def _current_env_sig():
+    return json.dumps({k: os.environ.get(k) for k in _ENV_CFG_KEYS + ['JARVIS_ENABLE_MIXIN', 'JARVIS_MIXIN_MAX_RETRIES', 'JARVIS_MIXIN_BASE_DELAY']}, sort_keys=True, ensure_ascii=False)
+
 def reload_mykeys():
-    global _mykey_mtime
-    mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path else -1
-    if mt == _mykey_mtime: return globals().get('mykeys', {}), False
-    mk = _load_mykeys(); _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
+    global _mykey_mtime, _mykey_sig
+    env_sig = _current_env_sig()
+    env_enabled = bool(os.environ.get('JARVIS_MYKEY_JSON', '').strip() or os.environ.get('JARVIS_APIKEY', '').strip())
+    if env_enabled:
+        if _mykey_path and _mykey_path.startswith('[env:') and env_sig == _mykey_sig:
+            return globals().get('mykeys', {}), False
+        mk = _load_mykeys()
+        _mykey_sig = env_sig
+        _mykey_mtime = None
+    else:
+        mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path and os.path.exists(_mykey_path) and not _mykey_path.startswith('[env:') else -1
+        if _mykey_path and not _mykey_path.startswith('[env:') and mt == _mykey_mtime:
+            return globals().get('mykeys', {}), False
+        mk = _load_mykeys()
+        if _mykey_path and _mykey_path.startswith('[env:'):
+            _mykey_sig = _current_env_sig()
+            _mykey_mtime = None
+        else:
+            _mykey_sig = env_sig
+            _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
     print(f'[Info] Load mykeys from {_mykey_path}')
     globals().update(mykeys=mk)
     if mk.get('langfuse_config'):
