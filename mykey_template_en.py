@@ -47,9 +47,9 @@ native_oai_config = {
     'name': 'gpt',                            # display name & mixin reference
     'apikey': 'sk-<your-openai-key>',
     'apibase': 'https://api.openai.com/v1',
-    'model': 'gpt-5.4',                       # or 'o4', 'gpt-5.3-codex', etc.
+    'model': 'gpt-5.5',                       # model id only; or 'o4', etc.
     'api_mode': 'chat_completions',           # or 'responses' for /v1/responses
-    # 'reasoning_effort': 'high',             # none|minimal|low|medium|high|xhigh
+    # 'reasoning_effort': 'xhigh',            # reasoning depth only
     # 'max_retries': 3,
     # 'read_timeout': 120,
 }

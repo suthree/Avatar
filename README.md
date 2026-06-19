@@ -137,9 +137,12 @@ uv venv && uv pip install -e ".[ui]"
 cp mykey_template_en.py mykey.py   # fill in your LLM API key
 
 # Alternative: environment variables
-# export JARVIS_APIKEY='sk-...'
-# export JARVIS_APIBASE='https://api.openai.com/v1'
-# export JARVIS_MODEL='gpt-5.4'
+# export APIKEY='sk-...'
+# export APIBASE='https://api.openai.com/v1'
+# export MODEL='gpt-5.5'
+# export REASONING_EFFORT='xhigh'  # optional; controls reasoning depth only
+#
+# Legacy JARVIS_* names still work as fallback, but generic names take precedence.
 
 # Alternative: TOML config
 # cp mykey.toml.example mykey.toml
