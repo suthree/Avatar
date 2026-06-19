@@ -16,6 +16,17 @@ HOST = "127.0.0.1"
 PORT = 8900
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conductor.html")
 
+REPLY_MODE = os.environ.get("AVATAR_REPLY_MODE", "compact").strip().lower()
+try:
+    REPLY_MAX_CHARS = int(os.environ.get("AVATAR_REPLY_MAX_CHARS", "1600"))
+except ValueError:
+    REPLY_MAX_CHARS = 1600
+REPLY_MAX_CHARS = max(400, REPLY_MAX_CHARS)
+REPLY_SHOW_FILES = os.environ.get("AVATAR_REPLY_SHOW_FILES", "on_request").strip().lower()
+
+COMPACT_REPLY_INSTRUCTION = """\
+对用户输出默认使用 compact 模式：先给一句结论/状态，再给必要证据和下一步；不要主动粘贴完整文档、日志、文件内容或工具输出；只有用户明确要求查看文件/内容时才使用 [FILE:path] 或贴正文；长内容改为说明“已保存/可查看某路径”。"""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -101,6 +112,61 @@ def clean_log_text(s: str) -> str:
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
 
+_CODE_BLOCK_RE = re.compile(r'```[^\n]*\n[\s\S]*?```')
+_FILE_TAG_RE = re.compile(r'\[FILE:([^\]\n]+)\]')
+_META_BLOCK_RE = re.compile(r'<(?:thinking|tool_use|tool_call|file_content)>[\s\S]*?</(?:thinking|tool_use|tool_call|file_content)>\s*', re.IGNORECASE)
+_SUMMARY_BLOCK_RE = re.compile(r'<summary>[\s\S]*?</summary>\s*', re.IGNORECASE)
+
+
+def _collapse_code_block(match: re.Match) -> str:
+    block = match.group(0)
+    lines = block.splitlines()
+    if len(lines) <= 8 and len(block) <= 700:
+        return block
+    lang = lines[0].strip('`').strip()
+    label = f"{lang} " if lang else ""
+    return f"```{lang}\n… 已折叠 {label}代码/日志块（{len(lines)} 行）；需要时请查看原报告或文件。\n```"
+
+
+def _summarize_file_tags(text: str) -> str:
+    files = _FILE_TAG_RE.findall(text or "")
+    if REPLY_SHOW_FILES != "on_request" or len(files) <= 3:
+        return text
+    first = []
+    seen = set()
+    for path in files:
+        if path in seen: continue
+        seen.add(path); first.append(path)
+        if len(first) >= 3: break
+    text = _FILE_TAG_RE.sub('', text).strip()
+    summary = "文件：" + "；".join(f"[FILE:{p}]" for p in first)
+    if len(files) > len(first):
+        summary += f"；另有 {len(files) - len(first)} 个文件未展开"
+    return summary + ("\n\n" + text if text else "")
+
+
+def _truncate_compact_text(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    head = max_chars - 90
+    head = max(200, head)
+    return text[:head].rstrip() + "\n\n…已按 compact 模式截断；如需完整内容，请让我展开或查看报告/文件。"
+
+
+def format_outbound_reply(msg: str, role: str = "conductor") -> str:
+    """Compact replies before they leave Conductor to user-facing channels."""
+    if not msg or role == "user" or REPLY_MODE in ("raw", "off", "none"):
+        return msg
+    text = str(msg)
+    text = _SUMMARY_BLOCK_RE.sub('', text)
+    text = _META_BLOCK_RE.sub('', text)
+    text = clean_log_text(text)
+    text = _summarize_file_tags(text)
+    text = _CODE_BLOCK_RE.sub(_collapse_code_block, text)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return _truncate_compact_text(text, REPLY_MAX_CHARS)
+
 def schedule_broadcast(payload: dict):
     if main_loop and main_loop.is_running():
         asyncio.run_coroutine_threadsafe(broadcast(payload), main_loop)
@@ -115,7 +181,8 @@ async def broadcast(payload: dict):
 def push_cards(): schedule_broadcast({"type": "subagents", "items": pool.snapshot()})
 
 def add_chat(msg: str, role: str = "conductor"):
-    item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user"}
+    outbound = format_outbound_reply(msg, role=role)
+    item = {"id": short_id(), "role": role, "msg": outbound, "ts": now_ms(), "read": role != "user"}
     chat_messages.append(item)
     if len(chat_messages) > 200: del chat_messages[:-200]
     schedule_broadcast({"type": "chat", "item": item})
@@ -242,14 +309,14 @@ GET /subagent/{{id}}?max_len=N\t返回单个subagent详情，reply经清洗后�
 用户消息流程：
 1. 结合记忆、上下文和用户偏好判断真实需求；不清楚/不能代劳时，用精简checklist一次性问用户。
 2. 判断是新任务还是延续现有任务；优先复用已有stopped subagent（用input追加），只有确实无关的新任务才新建。
-3. 分派前必须POST /chat告知用户：改写后的prompt + 分派方案（新建/复用哪个subagent）。
+3. 分派前必须POST /chat告知用户：只发一句确认 + 分派方案；不要粘贴完整改写prompt，除非用户要求确认全文。
 4. 执行分派，完成即停。危险操作（改源码/删数据/安全敏感）必须改成先让subagent出方案；你验收后POST /chat请用户确认，确认后才继续执行。""",
 "subagent": """\
 subagent完成流程：
 1. 如果是IM采集subagent，按GET /readme/im进行而非本流程
 2. 读subagent输出；若最后一条不足以判断，GET /subagent/{id}?max_len=3000 补足信息。
 3. 预测用户是否满意；不满意就reply/keyinfo要求返工、修改、优化，继续监督，不急着报告。
-4. 预计用户满意后，POST /chat给简洁交付报告。""",
+4. 预计用户满意后，POST /chat给 compact 交付报告：结论/状态 + 关键证据 + 下一步；不要粘贴完整日志、文档正文或长文件列表。""",
 "im": """\
 你要审查IM采集subagent的输出，把**值得用户关注的内容**报告给用户或转化成"可点击执行"的待批TODO（approval）。
 先读L2记忆中User相关，推荐的动作和措辞要符合用户画像。
@@ -293,7 +360,8 @@ API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /
 - 改写prompt时严禁添加用户未提及的假设、工具、前提条件。只能精炼/结构化用户原意，不能脑补，只能做很小的改写
 
 原则：
-- 信任subagent足够聪明，不要写具体步骤和容易探测的信息；能自己判断的自己判断，只在真正需要用户决策时打扰。\n
+- 信任subagent足够聪明，不要写具体步骤和容易探测的信息；能自己判断的自己判断，只在真正需要用户决策时打扰。
+- {COMPACT_REPLY_INSTRUCTION}\n
 需要处理：
 {summary}"""
 
