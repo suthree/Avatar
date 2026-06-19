@@ -289,9 +289,9 @@ native_oai_config = {
     'name': 'gpt-native',                           # /llms 显示名 & mixin 引用名
     'apikey': 'sk-<your-openai-key>',                # Bearer 鉴权
     'apibase': 'https://api.openai.com/v1',          # 补齐到 /v1/chat/completions
-    'model': 'gpt-5.4',                              # gpt-5/o 系列
+    'model': 'gpt-5.5',                              # 只控制 model id，不夹带推理深度
     'api_mode': 'chat_completions',                  # 'chat_completions'（默认）|'responses'
-    # 'reasoning_effort': 'high',                    # none|minimal|low|medium|high|xhigh
+    # 'reasoning_effort': 'xhigh',                   # 只控制推理深度
                                                      # chat_completions → payload.reasoning_effort
                                                      # responses        → payload.reasoning.effort
     'max_retries': 3,                                # int 默认 1
@@ -310,9 +310,9 @@ native_oai_config = {
 #     'name': 'gpt-responses',                       # /llms 显示名
 #     'apikey': 'sk-<your-openai-key>',              # Bearer 鉴权
 #     'apibase': 'https://api.openai.com/v1',        # 补齐到 /v1/responses（因为 api_mode=responses）
-#     'model': 'gpt-5.4',                            # gpt-5/o 系列
+#     'model': 'gpt-5.5',                            # 只控制 model id
 #     'api_mode': 'responses',                       # 改走 /v1/responses 端点
-#     'reasoning_effort': 'high',                    # none|minimal|low|medium|high|xhigh
+#     'reasoning_effort': 'xhigh',                   # 只控制推理深度
 #                                                    # responses 模式下写进 payload.reasoning.effort
 #     'max_retries': 2,                              # int 默认 1
 #     'read_timeout': 120,                           # int 秒 默认 30
