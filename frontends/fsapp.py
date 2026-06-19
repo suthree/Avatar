@@ -79,6 +79,16 @@ def _ensure_runtime_paths():
 
 _ensure_runtime_paths()
 from agentmain import GeneraticAgent
+import frontends.chatapp_common as chat_common
+from frontends.aegis_mesh_sessions import (
+    DEFAULT_AEGIS_REPORT_INTERVAL_SEC,
+    AegisMeshPeriodicReporter,
+    AegisMeshSessionManager,
+    build_feishu_session_id,
+    render_dashboard_text,
+    render_periodic_report_text,
+    render_session_status_text,
+)
 from frontends.chatapp_common import AgentChatMixin, FILE_HINT, split_text
 
 _TAG_PATS = [r"<" + t + r">.*?</" + t + r">" for t in ("thinking", "summary", "tool_use", "file_content")]
@@ -97,6 +107,7 @@ _FILE_TYPE_MAP = {
     ".pptx": "ppt",
 }
 _MSG_TYPE_MAP = {"image": "[image]", "audio": "[audio]", "file": "[file]", "media": "[media]", "sticker": "[sticker]"}
+_FEISHU_HELP_TEXT = chat_common.HELP_TEXT + "\n/report - 立即发送当前会话摘要\n/summary - 同上"
 
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 MEDIA_DIR = os.path.join(TEMP_DIR, "feishu_media")
@@ -148,6 +159,13 @@ def _display_text(text):
         return cleaned
     tail = (text or "").strip()[-_TRUNC_TAIL:]
     return "⚠️ 模型输出被截断或为空" + (f"\n…{tail}" if tail else "")
+
+
+def _result_summary(text, max_len=240):
+    summary = re.sub(r"\s+", " ", _display_text(text)).strip()
+    if len(summary) <= max_len:
+        return summary
+    return summary[: max_len - 1].rstrip() + "…"
 
 
 def _to_allowed_set(value):
@@ -324,9 +342,11 @@ AGENT_TIMEOUT_SEC = 900
 
 agent = None
 agent_error = None
-agent_thread = None
+session_manager = None
+periodic_reporter = None
 client, user_tasks, app = None, {}, None
-agent_lock = threading.Lock()
+agent_lock = threading.RLock()
+reporter_lock = threading.Lock()
 
 
 def _load_config():
@@ -349,24 +369,46 @@ def _feishu_config():
     return app_id, app_secret, allowed, (not allowed or "*" in allowed), path
 
 
+def _coerce_report_interval(raw):
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return DEFAULT_AEGIS_REPORT_INTERVAL_SEC
+
+
+def _aegis_report_interval_sec():
+    cfg, _ = _load_config()
+    raw = os.environ.get("FS_AEGIS_REPORT_INTERVAL_SEC")
+    if raw is None:
+        raw = cfg.get(
+            "fs_aegis_report_interval_sec",
+            cfg.get("FS_AEGIS_REPORT_INTERVAL_SEC", DEFAULT_AEGIS_REPORT_INTERVAL_SEC),
+        )
+    return _coerce_report_interval(raw)
+
+
 APP_ID, APP_SECRET, ALLOWED_USERS, PUBLIC_ACCESS, CONFIG_PATH = _feishu_config()
 
 
-def get_agent():
-    global agent, agent_error, agent_thread
+def get_session_manager():
+    global session_manager
     with agent_lock:
-        if agent is not None:
-            return agent
         if agent_error:
             raise RuntimeError(agent_error)
-        try:
-            agent = GeneraticAgent()
-            agent_thread = threading.Thread(target=agent.run, daemon=True)
-            agent_thread.start()
-            return agent
-        except Exception as e:
-            agent_error = str(e)
-            raise
+        if session_manager is None:
+            session_manager = AegisMeshSessionManager(GeneraticAgent)
+        return session_manager
+
+
+def get_agent(session_id=None):
+    global agent, agent_error
+    try:
+        sid = session_id or build_feishu_session_id(APP_ID, None, "__config_check__")
+        agent = get_session_manager().get_or_create(sid, label="config-check").agent
+        return agent
+    except Exception as e:
+        agent_error = str(e)
+        raise
 
 
 def create_client():
@@ -390,6 +432,7 @@ def check_config(init_agent=False):
         "public_access": public_access,
         "allowed_users": sorted(allowed),
         "ready": bool(app_id and app_secret),
+        "aegis_report_interval_sec": _aegis_report_interval_sec(),
     }
     if init_agent:
         try:
@@ -451,6 +494,36 @@ def send_message(receive_id, content, msg_type="text", use_card=False, receive_i
     if msg_type == "text":
         return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
     return _send_raw(receive_id, content, msg_type, receive_id_type)
+
+
+def _send_report_message(receive_id, content, receive_id_type="open_id"):
+    return send_message(receive_id, content, "text", False, receive_id_type)
+
+
+def _log_reporter_error(exc):
+    print(f"[ERROR] Aegis Mesh periodic report failed: {exc}")
+    traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+
+def start_aegis_periodic_reporter(interval_sec=None):
+    global periodic_reporter
+    interval = _aegis_report_interval_sec() if interval_sec is None else _coerce_report_interval(interval_sec)
+    if interval <= 0:
+        return None
+    with reporter_lock:
+        if periodic_reporter is None:
+            periodic_reporter = AegisMeshPeriodicReporter(
+                get_session_manager(),
+                send_fn=_send_report_message,
+                split_fn=split_text,
+                interval_sec=interval,
+                on_error=_log_reporter_error,
+            )
+        else:
+            periodic_reporter.interval_sec = interval
+        reporter = periodic_reporter
+    reporter.start()
+    return reporter
 
 
 def update_message(message_id, content):
@@ -651,7 +724,7 @@ class _TaskCard:
             detail = detail[:self._DETAIL_LIMIT] + f"\n\n…(已截断,共 {len(detail)} 字符)"
         return {
             "tag": "collapsible_panel", "expanded": False,
-            "header": {"title": {"tag": "plain_text", "content": f"Turn {idx} · {summary}"}},
+            "header": {"title": {"tag": "plain_text", "content": f"步骤 {idx} · {summary}"}},
             "elements": [{"tag": "markdown", "content": detail}],
         }
 
@@ -687,7 +760,7 @@ class _TaskCard:
 
     def step(self, summary, detail=""):
         self.steps.append((summary, detail))
-        self.status = f"⏳ 工作中 · Turn {len(self.steps)}"
+        self.status = f"⏳ 工作中 · 步骤 {len(self.steps)}"
         self._push()
 
     def done(self, text):
@@ -696,13 +769,18 @@ class _TaskCard:
         if not self._push():
             self._fallback_text(_display_text(text), final=True)
 
-    def fail(self, msg):
+    def fail(self, msg, detail=None):
         self.status = f"❌ {msg}"
+        if detail:
+            self.final = detail
         if not self._push():
-            self._fallback_text(f"❌ {msg}", final=True)
+            fallback = f"❌ {msg}"
+            if detail:
+                fallback = f"{fallback}\n\n{detail}"
+            self._fallback_text(fallback, final=True)
 
 
-def _make_task_hook(card, task_id, on_final):
+def _make_task_hook(card, task_id, on_final, on_progress=None):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
     def hook(ctx):
         try:
@@ -714,6 +792,8 @@ def _make_task_hook(card, task_id, on_final):
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
                 on_final(raw)
             elif ctx.get('summary'):
+                if on_progress:
+                    on_progress(ctx['summary'])
                 detail = _build_step_detail(ctx.get('response'), ctx.get('tool_calls') or [])
                 card.step(ctx['summary'], detail)
         except Exception as e:
@@ -723,6 +803,14 @@ def _make_task_hook(card, task_id, on_final):
 
 class FeishuApp(AgentChatMixin):
     label, source, split_limit = "Feishu", "feishu", 4000
+
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+        self.agent = None
+        self.user_tasks = {}
+
+    def _session_id(self, chat_id, session_id=None):
+        return session_id or chat_id
 
     async def send_text(self, chat_id, content, *, receive_id=None, receive_id_type="open_id", **_):
         rid = receive_id or chat_id
@@ -735,37 +823,126 @@ class FeishuApp(AgentChatMixin):
         await asyncio.to_thread(send_message, rid, text, "text", False, receive_id_type)
         await asyncio.to_thread(_send_generated_files, rid, raw_text, receive_id_type)
 
-    async def run_agent(self, chat_id, text, *, receive_id=None, receive_id_type="open_id", images=None, **_):
-        if self.user_tasks:
+    async def handle_command(self, chat_id, cmd, *, session_id=None, **ctx):
+        mesh_session_id = self._session_id(chat_id, session_id)
+        parts = (cmd or "").split()
+        op = (parts[0] if parts else "").lower()
+        if op == "/help":
+            return await self.send_text(chat_id, _FEISHU_HELP_TEXT, **ctx)
+        if op == "/stop":
+            stopped = self.session_manager.stop_task(mesh_session_id)
+            msg = "⏹️ 正在停止..." if stopped else "当前会话没有正在运行的任务。"
+            return await self.send_text(chat_id, msg, **ctx)
+        if op == "/dashboard" or (op == "/status" and len(parts) > 1 and parts[1].lower() == "all"):
+            return await self.send_text(
+                chat_id,
+                render_dashboard_text(self.session_manager.dashboard_snapshot()),
+                **ctx,
+            )
+        if op in ("/report", "/summary"):
+            return await self.send_text(
+                chat_id,
+                render_periodic_report_text(
+                    self.session_manager.dashboard_snapshot(),
+                    target_session_id=mesh_session_id,
+                ),
+                **ctx,
+            )
+
+        state = self.session_manager.get_or_create(mesh_session_id, label=chat_id)
+        agent = state.agent
+        if op == "/status":
+            llm = agent.get_llm_name() if getattr(agent, "llmclient", None) else "未配置"
+            status_text = render_session_status_text(
+                self.session_manager.snapshot(mesh_session_id),
+                dashboard=self.session_manager.dashboard_snapshot(),
+            )
+            return await self.send_text(chat_id, f"{status_text}\nLLM: [{getattr(agent, 'llm_no', 0)}] {llm}", **ctx)
+        if op == "/llm":
+            if not getattr(agent, "llmclient", None):
+                return await self.send_text(chat_id, "❌ 当前没有可用的 LLM 配置", **ctx)
+            if len(parts) > 1:
+                try:
+                    agent.next_llm(int(parts[1]))
+                    return await self.send_text(chat_id, f"✅ 已切换到 [{agent.llm_no}] {agent.get_llm_name()}", **ctx)
+                except Exception:
+                    return await self.send_text(chat_id, f"用法: /llm <0-{len(agent.list_llms()) - 1}>", **ctx)
+            lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in agent.list_llms()]
+            return await self.send_text(chat_id, "LLMs:\n" + "\n".join(lines), **ctx)
+        if op == "/restore":
+            try:
+                restored_info, err = chat_common.format_restore()
+                if err:
+                    return await self.send_text(chat_id, err, **ctx)
+                restored, fname, count = restored_info
+                agent.abort()
+                agent.history.extend(restored)
+                return await self.send_text(chat_id, f"✅ 已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)", **ctx)
+            except Exception as e:
+                return await self.send_text(chat_id, f"❌ 恢复失败: {e}", **ctx)
+        if op == "/continue":
+            return await self.send_text(chat_id, chat_common._handle_continue_frontend(agent, cmd), **ctx)
+        if op == "/new":
+            return await self.send_text(chat_id, chat_common._reset_conversation(agent), **ctx)
+        if op == "/btw":
+            answer = await asyncio.to_thread(chat_common._handle_btw_frontend, agent, cmd)
+            return await self.send_text(chat_id, answer, **ctx)
+        if op == "/review":
+            return await self.run_agent(chat_id, cmd, session_id=mesh_session_id, **ctx)
+        return await self.send_text(chat_id, _FEISHU_HELP_TEXT, **ctx)
+
+    async def run_agent(self, chat_id, text, *, receive_id=None, receive_id_type="open_id", session_id=None, images=None, **_):
+        mesh_session_id = self._session_id(chat_id, session_id)
+        task_id = f"{mesh_session_id}_{uuid.uuid4().hex}"
+        state, active_task = self.session_manager.begin_task(
+            mesh_session_id,
+            task_id,
+            label=chat_id,
+            metadata={"receive_id": receive_id or chat_id, "receive_id_type": receive_id_type},
+        )
+        if active_task is None:
             await self.send_text(chat_id, "当前会话已有任务在运行，请等待完成或发送 /stop 后再试。", receive_id=receive_id, receive_id_type=receive_id_type)
             return
-        state = {"running": True}
-        self.user_tasks[chat_id] = state
+        agent = state.agent
         rid = receive_id or chat_id
-        task_id = f"{chat_id}_{uuid.uuid4().hex}"
         hook_key = f"fs_{task_id}"
         card = _TaskCard(rid, receive_id_type)
         result = {"raw": None, "sent": False}
         finish_lock = threading.Lock()
 
-        def _finish(raw):
+        def _task_status_text():
+            return render_session_status_text(
+                self.session_manager.snapshot(mesh_session_id),
+                dashboard=self.session_manager.dashboard_snapshot(),
+            )
+
+        def _claim_terminal():
             with finish_lock:
                 if result["sent"]:
-                    return
-                result["raw"] = raw
+                    return False
                 result["sent"] = True
-            card.done(_display_text(raw))
+                return True
+
+        def _finish(raw):
+            if not _claim_terminal():
+                return
+            result["raw"] = raw
+            self.session_manager.complete_task(mesh_session_id, task_id, result_summary=_result_summary(raw))
+            card.done(f"{_task_status_text()}\n\n结果:\n{_display_text(raw)}")
             _send_generated_files(rid, raw, receive_id_type=receive_id_type)
+
+        def _record_progress(summary):
+            self.session_manager.record_task_event(mesh_session_id, task_id, message=summary)
 
         try:
             await asyncio.to_thread(card.start)
-            if not hasattr(self.agent, '_turn_end_hooks'):
-                self.agent._turn_end_hooks = {}
-            self.agent._turn_end_hooks[hook_key] = _make_task_hook(card, task_id, _finish)
-            self.agent._fs_active_task_id = task_id
-            dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source, images=images or None)
+            if not hasattr(agent, '_turn_end_hooks'):
+                agent._turn_end_hooks = {}
+            agent._turn_end_hooks[hook_key] = _make_task_hook(card, task_id, _finish, _record_progress)
+            agent._fs_active_task_id = task_id
+            dq = agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source, images=images or None)
             start = time.time()
-            while state["running"] and not result["sent"]:
+            while active_task.running and not result["sent"]:
                 try:
                     item = await asyncio.to_thread(dq.get, True, 1)
                 except Q.Empty:
@@ -774,30 +951,36 @@ class FeishuApp(AgentChatMixin):
                     await asyncio.to_thread(_finish, item.get("done", ""))
                     break
                 if time.time() - start > AGENT_TIMEOUT_SEC:
-                    self.agent.abort()
-                    await asyncio.to_thread(card.fail, "任务超时")
+                    error_msg = "任务超时"
+                    self.session_manager.fail_task(mesh_session_id, task_id, error=error_msg)
+                    abort = getattr(agent, "abort", None)
+                    if callable(abort):
+                        abort()
+                    if _claim_terminal():
+                        await asyncio.to_thread(card.fail, error_msg, _task_status_text())
                     break
-            if not state["running"] and not result["sent"]:
-                self.agent.abort()
-                await asyncio.to_thread(card.fail, "已停止")
+            if not active_task.running and _claim_terminal():
+                await asyncio.to_thread(card.fail, "已停止", _task_status_text())
         except Exception as e:
             traceback.print_exc()
-            await asyncio.to_thread(card.fail, f"错误: {e}")
+            error_msg = f"错误: {e}"
+            self.session_manager.fail_task(mesh_session_id, task_id, error=error_msg)
+            if _claim_terminal():
+                await asyncio.to_thread(card.fail, error_msg, _task_status_text())
         finally:
-            if getattr(self.agent, "_fs_active_task_id", None) == task_id:
+            if getattr(agent, "_fs_active_task_id", None) == task_id:
                 try:
-                    delattr(self.agent, "_fs_active_task_id")
+                    delattr(agent, "_fs_active_task_id")
                 except AttributeError:
                     pass
-            if hasattr(self.agent, '_turn_end_hooks'):
-                self.agent._turn_end_hooks.pop(hook_key, None)
-            self.user_tasks.pop(chat_id, None)
+            if hasattr(agent, '_turn_end_hooks'):
+                agent._turn_end_hooks.pop(hook_key, None)
 
 
 def get_app():
     global app
     if app is None:
-        app = FeishuApp(get_agent(), user_tasks)
+        app = FeishuApp(get_session_manager())
     return app
 
 
@@ -829,17 +1012,18 @@ def handle_message(data):
     print(f"收到消息 [{open_id}] ({message.message_type}, {len(image_paths)} images): {user_input[:200]}")
     receive_id = chat_id or open_id
     receive_id_type = "chat_id" if chat_id else "open_id"
+    session_id = build_feishu_session_id(APP_ID, chat_id, open_id)
     chat_key = receive_id
     if message.message_type == "text" and user_input.startswith("/"):
         threading.Thread(
             target=_run_async,
-            args=(get_app().handle_command(chat_key, user_input, receive_id=receive_id, receive_id_type=receive_id_type),),
+            args=(get_app().handle_command(chat_key, user_input, session_id=session_id, receive_id=receive_id, receive_id_type=receive_id_type),),
             daemon=True,
         ).start()
         return
     threading.Thread(
         target=_run_async,
-        args=(get_app().run_agent(chat_key, user_input, receive_id=receive_id, receive_id_type=receive_id_type, images=image_paths),),
+        args=(get_app().run_agent(chat_key, user_input, session_id=session_id, receive_id=receive_id, receive_id_type=receive_id_type, images=image_paths),),
         daemon=True,
     ).start()
 
@@ -855,8 +1039,10 @@ def main():
     while True:
         try:
             client = create_client()
+            reporter = start_aegis_periodic_reporter()
             cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
-            print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n配置: {CONFIG_PATH}\n等待消息...\n" + "=" * 50, flush=True)
+            report_line = f"摘要报告间隔: {reporter.interval_sec}s\n" if reporter else "摘要报告: 已禁用\n"
+            print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n配置: {CONFIG_PATH}\n{report_line}等待消息...\n" + "=" * 50, flush=True)
             cli.start()
             retry_delay = 5
         except KeyboardInterrupt:
