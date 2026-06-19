@@ -135,6 +135,15 @@ curl -fsSL https://raw.githubusercontent.com/lsdefine/GenericAgent/refs/heads/ma
 git clone https://github.com/lsdefine/GenericAgent.git && cd GenericAgent
 uv venv && uv pip install -e ".[ui]"
 cp mykey_template_en.py mykey.py   # fill in your LLM API key
+
+# Alternative: environment variables
+# export JARVIS_APIKEY='sk-...'
+# export JARVIS_APIBASE='https://api.openai.com/v1'
+# export JARVIS_MODEL='gpt-5.4'
+
+# Alternative: TOML config
+# cp mykey.toml.example mykey.toml
+# edit mykey.toml and fill in your LLM API key
 ```
 
 Dependencies are deliberately tiered: the agent core needs only `requests`, plus four lightweight packages (`beautifulsoup4`, `bottle`, `simple-websocket-server`, `aiohttp`) for TMWebdriver's local server. The `[ui]` extra pulls in frontend libraries (Streamlit, `prompt_toolkit`/`rich` for the TUI, …) — install it for the bundled UIs, or skip it entirely and drive the agent headless. No Playwright, no LangChain, no browser binaries to download.

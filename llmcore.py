@@ -4,9 +4,90 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4()); _RESP_CODEX_KEY = str(uuid.uuid4())
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path: sys.path.append(_ROOT)
+try: import tomllib
+except Exception:
+    try: import tomli as tomllib
+    except Exception: tomllib = None
+
+_ENV_CFG_KEYS = [
+    'JARVIS_MYKEY_JSON', 'JARVIS_APIKEY', 'JARVIS_APIBASE', 'JARVIS_MODEL', 'JARVIS_NAME',
+    'JARVIS_API_MODE', 'JARVIS_MAX_RETRIES', 'JARVIS_CONNECT_TIMEOUT', 'JARVIS_TIMEOUT',
+    'JARVIS_READ_TIMEOUT', 'JARVIS_CONTEXT_WIN', 'JARVIS_MAX_TOKENS', 'JARVIS_TEMPERATURE',
+    'JARVIS_PROXY', 'JARVIS_REASONING_EFFORT', 'JARVIS_SERVICE_TIER', 'JARVIS_THINKING_TYPE',
+    'JARVIS_THINKING_BUDGET_TOKENS', 'JARVIS_STREAM', 'JARVIS_VERIFY', 'JARVIS_USER_AGENT',
+    'JARVIS_CONFIG_TOML', 'JARVIS_ENABLE_MIXIN', 'JARVIS_MIXIN_MAX_RETRIES', 'JARVIS_MIXIN_BASE_DELAY'
+]
+
+def _coerce_env_value(v):
+    if not isinstance(v, str): return v
+    s = v.strip()
+    if not s: return s
+    if s.lower() in ('true', 'false'): return s.lower() == 'true'
+    if s.lower() in ('none', 'null'): return None
+    try: return json.loads(s)
+    except Exception: return s
+
+def _load_mykeys_from_env():
+    raw = os.environ.get('JARVIS_MYKEY_JSON', '').strip()
+    if raw:
+        try: data = json.loads(raw)
+        except Exception as e: raise Exception(f'[ERROR] Invalid JARVIS_MYKEY_JSON: {e}') from e
+        if not isinstance(data, dict): raise Exception('[ERROR] JARVIS_MYKEY_JSON must be a JSON object.')
+        return data
+    apikey = os.environ.get('JARVIS_APIKEY', '').strip()
+    if not apikey: return None
+    name = os.environ.get('JARVIS_NAME', 'gpt-native').strip() or 'gpt-native'
+    cfg = {
+        'name': name,
+        'apikey': apikey,
+        'apibase': os.environ.get('JARVIS_APIBASE', 'https://api.openai.com/v1').strip() or 'https://api.openai.com/v1',
+        'model': os.environ.get('JARVIS_MODEL', 'gpt-5.4').strip() or 'gpt-5.4',
+        'api_mode': os.environ.get('JARVIS_API_MODE', 'chat_completions').strip() or 'chat_completions',
+    }
+    for env_k, cfg_k in [
+        ('JARVIS_MAX_RETRIES', 'max_retries'),
+        ('JARVIS_CONNECT_TIMEOUT', 'connect_timeout'),
+        ('JARVIS_TIMEOUT', 'timeout'),
+        ('JARVIS_READ_TIMEOUT', 'read_timeout'),
+        ('JARVIS_CONTEXT_WIN', 'context_win'),
+        ('JARVIS_MAX_TOKENS', 'max_tokens'),
+        ('JARVIS_TEMPERATURE', 'temperature'),
+        ('JARVIS_PROXY', 'proxy'),
+        ('JARVIS_REASONING_EFFORT', 'reasoning_effort'),
+        ('JARVIS_SERVICE_TIER', 'service_tier'),
+        ('JARVIS_THINKING_TYPE', 'thinking_type'),
+        ('JARVIS_THINKING_BUDGET_TOKENS', 'thinking_budget_tokens'),
+        ('JARVIS_STREAM', 'stream'),
+        ('JARVIS_VERIFY', 'verify'),
+        ('JARVIS_USER_AGENT', 'user_agent'),
+    ]:
+        if env_k in os.environ and os.environ[env_k].strip() != '': cfg[cfg_k] = _coerce_env_value(os.environ[env_k])
+    out = {'native_oai_config': cfg}
+    if os.environ.get('JARVIS_ENABLE_MIXIN', '1').strip().lower() not in ('0', 'false', 'no'):
+        out['mixin_config'] = {
+            'llm_nos': [name],
+            'max_retries': int(_coerce_env_value(os.environ.get('JARVIS_MIXIN_MAX_RETRIES', '2'))),
+            'base_delay': float(_coerce_env_value(os.environ.get('JARVIS_MIXIN_BASE_DELAY', '0.5'))),
+        }
+    return out
+
+def _load_toml_mykeys(p):
+    global _mykey_path
+    if tomllib is None: raise Exception('[ERROR] tomllib/tomli unavailable, cannot load mykey.toml')
+    _mykey_path = p
+    with open(p, 'rb') as f: return tomllib.load(f)
 
 def _load_mykeys():
     global _mykey_path
+    env_cfg = _load_mykeys_from_env()
+    if env_cfg is not None:
+        _mykey_path = '[env:JARVIS_*]'
+        return env_cfg
+    root = os.path.dirname(os.path.abspath(__file__))
+    explicit_toml = os.environ.get('JARVIS_CONFIG_TOML', '').strip()
+    if explicit_toml:
+        if not os.path.exists(explicit_toml): raise Exception(f'[ERROR] JARVIS_CONFIG_TOML not found: {explicit_toml}')
+        return _load_toml_mykeys(explicit_toml)
     try:
         import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
         return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
@@ -15,23 +96,40 @@ def _load_mykeys():
             raise Exception(f'[ERROR] mykey.py found but failed to import: {e}') from e
     except SyntaxError as e:
         raise Exception(f'[ERROR] mykey.py has syntax error: {e}') from e
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mykey.json')
-    if not os.path.exists(p): raise Exception('[ERROR] mykey.py not found in sys.path and mykey.json not found. Run "python configure_mykey.py" or copy mykey_template.py to mykey.py and fill in your keys.')
+    p = os.path.join(root, 'mykey.toml')
+    if os.path.exists(p): return _load_toml_mykeys(p)
+    p = os.path.join(root, 'mykey.json')
+    if not os.path.exists(p): raise Exception('[ERROR] No config found. Supported: env JARVIS_*, explicit JARVIS_CONFIG_TOML, mykey.py, mykey.toml, mykey.json. Run "python configure_mykey.py" or copy mykey_template.py/mykey.toml.example and fill in your keys.')
     with open(_mykey_path := p, encoding='utf-8') as f: mk = json.load(f)
     if isinstance(mk, dict) and 'remote_url' in mk: return requests.get(mk['remote_url'], timeout=10).json()
     return mk
 
-_mykey_path = _mykey_mtime = None
+_mykey_path = _mykey_mtime = _mykey_sig = None
+def _current_env_sig():
+    return json.dumps({k: os.environ.get(k) for k in _ENV_CFG_KEYS}, sort_keys=True, ensure_ascii=False)
+
 def reload_mykeys():
-    global _mykey_mtime
-    try:
-        mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path else -1
+    global _mykey_mtime, _mykey_sig
+    env_sig = _current_env_sig()
+    env_enabled = bool(os.environ.get('JARVIS_MYKEY_JSON', '').strip() or os.environ.get('JARVIS_APIKEY', '').strip())
+    if env_enabled and _mykey_path and str(_mykey_path).startswith('[env:') and env_sig == _mykey_sig:
+        return globals().get('mykeys', {}), False
+    if not env_enabled and _mykey_path and not str(_mykey_path).startswith('[env:') and os.path.exists(_mykey_path):
+        mt = os.stat(_mykey_path).st_mtime_ns
         if mt == _mykey_mtime: return globals().get('mykeys', {}), False
-        mk = _load_mykeys(); _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
-        print(f'[Info] Load mykeys from {_mykey_path}')
-        globals().update(mykeys=mk)
-        return mk, True
-    except: return globals().get('mykeys', {}), False
+    try:
+        mk = _load_mykeys()
+    except Exception:
+        if not globals().get('mykeys'):
+            raise
+        return globals().get('mykeys', {}), False
+    if _mykey_path and str(_mykey_path).startswith('[env:'):
+        _mykey_sig = env_sig; _mykey_mtime = None
+    elif _mykey_path and os.path.exists(_mykey_path):
+        _mykey_sig = env_sig; _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
+    print(f'[Info] Load mykeys from {_mykey_path}')
+    globals().update(mykeys=mk)
+    return mk, True
 
 def __getattr__(name):  # once guard in PEP 562
     if name == 'mykeys': return reload_mykeys()[0]
@@ -539,7 +637,7 @@ class BaseSession:
         self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 40) if self.stream else (10, 240)
-        self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
+        self.connect_timeout = max(1, int(cfg.get('connect_timeout', cfg.get('timeout', default_ct))))
         self.read_timeout = max(5, int(cfg.get('read_timeout', default_rt)))
         def _enum(key, valid):
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
