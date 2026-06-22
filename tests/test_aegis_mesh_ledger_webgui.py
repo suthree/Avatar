@@ -1,7 +1,12 @@
+import os
+from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
-from pathlib import Path
+from unittest import mock
 
+from frontends import aegis_mesh_ledger
 from frontends.aegis_mesh_ledger import AegisMeshLedger
 from frontends.aegis_mesh_sessions import (
     TASK_COMPLETED,
@@ -24,6 +29,25 @@ class AegisMeshLedgerTests(unittest.TestCase):
         path = Path(tmpdir) / "state" / "aegis_mesh.sqlite3"
         return AegisMeshLedger(path, time_fn=lambda: now)
 
+    def test_default_ledger_path_uses_main_repo_state_from_project_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            avatar_root = Path(tmp) / "Avatar"
+            worktree_root = avatar_root / ".worktree" / "issue-13-aegis-mesh-webgui"
+            frontend_dir = worktree_root / "frontends"
+            frontend_dir.mkdir(parents=True)
+
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    aegis_mesh_ledger,
+                    "__file__",
+                    str(frontend_dir / "aegis_mesh_ledger.py"),
+                ),
+            ):
+                path = aegis_mesh_ledger.default_aegis_mesh_ledger_path()
+
+            self.assertEqual(path, avatar_root / "temp" / "state" / "aegis_mesh_ledger.sqlite3")
+
     def test_ledger_persists_sessions_tasks_events_and_artifacts_after_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = self.make_ledger(tmp, now=1000.0)
@@ -44,7 +68,7 @@ class AegisMeshLedgerTests(unittest.TestCase):
                 artifacts={
                     "github_issue_url": "https://github.com/suthree/Avatar/issues/13",
                     "branch": "issue/13-aegis-mesh-webgui",
-                    "worktree": "/srv/projects/develop/Avatar_worktrees/issue13-aegis-mesh-webgui",
+                    "worktree": "/srv/projects/develop/Avatar/.worktree/issue13-aegis-mesh-webgui",
                     "codex_pid": "99999999",
                     "log_path": "/tmp/codex.log",
                 },
@@ -65,7 +89,10 @@ class AegisMeshLedgerTests(unittest.TestCase):
             self.assertEqual(reloaded_snapshot["sessions"], first_snapshot["sessions"])
             task = reloaded_snapshot["sessions"]["session-a"]["tasks"]["task-13"]
             self.assertEqual(task["phase"], "codex_running")
-            self.assertEqual(task["artifacts"]["worktree"], "/srv/projects/develop/Avatar_worktrees/issue13-aegis-mesh-webgui")
+            self.assertEqual(
+                task["artifacts"]["worktree"],
+                "/srv/projects/develop/Avatar/.worktree/issue13-aegis-mesh-webgui",
+            )
             self.assertEqual(task["events"][0]["message"], "Codex is implementing durable state")
             reloaded.close()
 
@@ -131,6 +158,21 @@ class AegisMeshLedgerTests(unittest.TestCase):
 
 
 class AegisMeshWebGuiTests(unittest.TestCase):
+    def test_webgui_script_entrypoint_is_runnable_directly(self):
+        script = Path(__file__).resolve().parents[1] / "frontends" / "aegis_mesh_webgui.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(script), "--help"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Serve or render the local Aegis Mesh task board", result.stdout)
+
     def test_dashboard_renders_grouped_board_and_task_detail_without_log_or_secret_dump(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = AegisMeshLedger(Path(tmp) / "aegis_mesh.sqlite3", time_fn=lambda: 3000.0)
@@ -147,7 +189,7 @@ class AegisMeshWebGuiTests(unittest.TestCase):
                     "project": "Avatar",
                     "repo": "suthree/Avatar",
                     "branch": "issue/13-aegis-mesh-webgui",
-                    "worktree": "/srv/projects/develop/Avatar_worktrees/issue13-aegis-mesh-webgui",
+                    "worktree": "/srv/projects/develop/Avatar/.worktree/issue13-aegis-mesh-webgui",
                     "codex_pid": "99999999",
                     "log_path": "/tmp/codex.log",
                     "answer_path": "/tmp/answer.md",
@@ -189,7 +231,7 @@ class AegisMeshWebGuiTests(unittest.TestCase):
             self.assertIn("data-board-group=\"blocked/requires_user\"", html)
             self.assertIn("data-board-group=\"done/completed\"", html)
             self.assertIn('href="https://github.com/suthree/Avatar/issues/13"', html)
-            self.assertIn("/srv/projects/develop/Avatar_worktrees/issue13-aegis-mesh-webgui", html)
+            self.assertIn("/srv/projects/develop/Avatar/.worktree/issue13-aegis-mesh-webgui", html)
             self.assertIn("/tmp/codex.log", html)
             self.assertIn("/tmp/answer.md", html)
             self.assertIn("/tmp/handoff.md", html)

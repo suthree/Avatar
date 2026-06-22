@@ -1,0 +1,21 @@
+{
+  "id": "06-22-worktree-issue-audit",
+  "title": "Audit local worktrees and GitHub issues 1-12",
+  "type": "audit",
+  "status": "done",
+  "risk": "low",
+  "created_at": "2026-06-22",
+  "sources": [
+    "user request",
+    "git worktree list",
+    "GitHub issues 1-12",
+    ".trellis/workflow.md",
+    ".trellis/spec/development-environment.md"
+  ],
+  "acceptance": [
+    "Local worktree layout is summarized",
+    "Remote open issues 1-12 are checked for close readiness",
+    "Default worktree location is recorded as .worktree/ under the project root",
+    "No GitHub issues are closed without explicit user approval"
+  ]
+}

@@ -74,6 +74,20 @@ Ledger path priority:
 
 The ledger is runtime state. It may be inspected for verification, but it must not be committed.
 
+When running Avatar from `.worktree/<slug>`, the default ledger remains shared at the main
+Avatar checkout's `temp/state/aegis_mesh_ledger.sqlite3`. Use `AEGIS_MESH_LEDGER_PATH` when a
+task needs an isolated ledger.
+
+## Worktrees
+
+Local development worktrees default to `.worktree/` under the project root:
+
+```text
+.worktree/<task-or-branch-slug>
+```
+
+Do not create new Avatar development worktrees in the parent directory with names like `Avatar_worktrees` or `<project>_worktrees`. Existing parent-level worktree directories are legacy state and should be audited before moving or removing.
+
 ## Verification
 
 Run targeted tests for the area changed. Useful commands:

@@ -53,6 +53,8 @@ def default_aegis_mesh_ledger_path() -> Path:
         return Path(workspace_root).expanduser() / "temp" / "state" / "aegis_mesh_ledger.sqlite3"
 
     project_root = Path(__file__).resolve().parents[1]
+    if project_root.parent.name == ".worktree":
+        return project_root.parent.parent / "temp" / "state" / "aegis_mesh_ledger.sqlite3"
     if project_root.parent.name == "Avatar_worktrees":
         avatar_root = project_root.parent.parent / "Avatar"
         if avatar_root.exists():

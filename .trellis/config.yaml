@@ -16,12 +16,14 @@ paths:
   spec: .trellis/spec
   tasks: .trellis/tasks
   workspace: .trellis/workspace
+  worktrees: .worktree
   scripts: .trellis/scripts
 
 local_only:
   - .trellis/workspace
   - .trellis/.developer
   - .trellis/.runtime
+  - .worktree
 
 validation:
   task_command: python3 .trellis/scripts/task.py validate <task-id>

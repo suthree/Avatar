@@ -18,6 +18,7 @@ The personal agent harness is Avatar's thin control plane direction. It must pre
 - Do not enable MCP or skills implicitly.
 - Keep stores file-backed and standard-library first.
 - Development-task worktrees must be opt-in and isolated from the main checkout.
+- When the harness allocates local development worktrees for Avatar, the default root is `.worktree/` under the project root.
 
 ## Trellis Link
 

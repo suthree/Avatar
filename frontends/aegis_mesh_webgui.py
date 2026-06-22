@@ -4,10 +4,15 @@ import argparse
 import html
 import json
 import os
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import parse_qs, urlparse
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from frontends.aegis_mesh_ledger import AegisMeshLedger, default_aegis_mesh_ledger_path
 

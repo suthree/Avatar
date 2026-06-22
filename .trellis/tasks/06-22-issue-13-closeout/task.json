@@ -1,0 +1,23 @@
+{
+  "id": "06-22-issue-13-closeout",
+  "title": "Close out GitHub issue 13 Aegis Mesh Web GUI MVP",
+  "type": "verification",
+  "status": "done",
+  "risk": "low",
+  "created_at": "2026-06-22",
+  "sources": [
+    "user request",
+    "https://github.com/suthree/Avatar/issues/13",
+    "docs/GA_CODEX_LOOP.md",
+    ".trellis/workflow.md",
+    ".trellis/spec/aegis-mesh-workflow.md",
+    ".trellis/spec/development-environment.md"
+  ],
+  "acceptance": [
+    "Issue 13 scope is treated as MVP closeout, not scope expansion",
+    "Local .worktree default ledger behavior is documented and tested",
+    "Legacy Avatar_worktrees examples are replaced where they affect issue 13 verification",
+    "Focused and full tests, py_compile, Trellis validation, diff check, and GUI smoke evidence are recorded",
+    "GitHub issue 13 is updated with evidence and closed after user approval"
+  ]
+}
