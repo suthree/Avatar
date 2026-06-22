@@ -114,6 +114,9 @@ class AegisMeshSessionManager:
         time_fn: Callable[[], float] = time.time,
         notification_limit: int = 100,
         task_event_limit: int = 50,
+        ledger: Optional[Any] = None,
+        platform: Optional[str] = None,
+        source: Optional[str] = None,
     ):
         self._agent_factory = agent_factory
         self._start_agent = start_agent
@@ -122,6 +125,9 @@ class AegisMeshSessionManager:
         self._sessions: Dict[str, AegisMeshSessionState] = {}
         self._notifications: Deque[Dict[str, Any]] = deque(maxlen=max(0, int(notification_limit)))
         self._task_event_limit = max(0, int(task_event_limit))
+        self._ledger = ledger
+        self._ledger_platform = platform
+        self._ledger_source = source
 
     def get_or_create(self, session_id: str, *, label: Optional[str] = None) -> AegisMeshSessionState:
         if not session_id:
@@ -133,6 +139,7 @@ class AegisMeshSessionManager:
                 if label and state.label != label:
                     state.label = label
                 state.updated_at = now
+                self._mirror_session_locked(state, timestamp=now)
                 return state
 
             agent = self._agent_factory()
@@ -146,6 +153,7 @@ class AegisMeshSessionManager:
                 label=label,
             )
             self._sessions[session_id] = state
+            self._mirror_session_locked(state, timestamp=now)
             return state
 
     def begin_task(
@@ -502,6 +510,70 @@ class AegisMeshSessionManager:
                     "metadata": dict(task.metadata),
                 }
             )
+        self._mirror_task_event_locked(state, task, event, timestamp=now)
+
+    def _mirror_session_locked(self, state: AegisMeshSessionState, *, timestamp: float) -> None:
+        if self._ledger is None:
+            return
+        self._ledger.upsert_session(
+            state.session_id,
+            label=state.label,
+            platform=self._ledger_platform,
+            source=self._ledger_source,
+            metadata={"agent_running": bool(getattr(state.agent, "is_running", False))},
+            timestamp=timestamp,
+        )
+
+    def _mirror_task_event_locked(
+        self,
+        state: AegisMeshSessionState,
+        task: AegisMeshActiveTask,
+        event: Dict[str, Any],
+        *,
+        timestamp: float,
+    ) -> None:
+        if self._ledger is None:
+            return
+        self._mirror_session_locked(state, timestamp=timestamp)
+        phase = self._ledger_phase_for_task(task)
+        self._ledger.upsert_task(
+            state.session_id,
+            task.task_id,
+            label=task.label,
+            status=task.status,
+            phase=phase,
+            metadata=dict(task.metadata),
+            result_summary=task.result_summary,
+            error=task.error,
+            started_at=task.started_at,
+            completed_at=task.completed_at,
+            timestamp=timestamp,
+        )
+        self._ledger.record_event(
+            state.session_id,
+            task.task_id,
+            event_type=event["event_type"],
+            status=event.get("status"),
+            phase=phase,
+            message=event.get("message"),
+            result_summary=event.get("result_summary"),
+            error=event.get("error"),
+            metadata=event.get("metadata") or {},
+            timestamp=timestamp,
+        )
+
+    @staticmethod
+    def _ledger_phase_for_task(task: AegisMeshActiveTask) -> str:
+        phase = str((task.metadata or {}).get("phase") or "").strip()
+        if phase:
+            return phase
+        if task.status == TASK_COMPLETED:
+            return "done"
+        if task.status == TASK_FAILED:
+            return "failed"
+        if task.status == TASK_STOPPED:
+            return "stopped"
+        return "codex_running"
 
     @staticmethod
     def _snapshot_state(state: Optional[AegisMeshSessionState]) -> Dict[str, Any]:
