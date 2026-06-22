@@ -1,0 +1,28 @@
+project: Avatar
+repo: suthree/Avatar
+workflow: aegis_mesh_codex_loop
+session_auto_commit: false
+
+branches:
+  development: develop
+  stable: main
+  integration_path:
+    - feature branch or worktree
+    - develop
+    - main
+
+paths:
+  docs: docs
+  spec: .trellis/spec
+  tasks: .trellis/tasks
+  workspace: .trellis/workspace
+  scripts: .trellis/scripts
+
+local_only:
+  - .trellis/workspace
+  - .trellis/.developer
+  - .trellis/.runtime
+
+validation:
+  task_command: python3 .trellis/scripts/task.py validate <task-id>
+  default_tests: python3 -m unittest discover -s tests -v

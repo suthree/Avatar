@@ -1,0 +1,19 @@
+{
+  "id": "05-22-personal-agent-harness",
+  "title": "Personal Agent Harness design and implementation plan",
+  "type": "feature-plan",
+  "status": "planning",
+  "risk": "medium",
+  "created_at": "2026-05-22",
+  "migrated_at": "2026-06-22",
+  "sources": [
+    "docs/superpowers/specs/2026-05-22-personal-agent-harness-design.md",
+    "docs/superpowers/plans/2026-05-22-personal-agent-harness.md"
+  ],
+  "acceptance": [
+    "Harness design is preserved as task design context",
+    "Harness implementation checklist is preserved as task implementation context",
+    "Stable harness rules are summarized in .trellis/spec/personal-agent-harness.md",
+    "No runtime code is changed by the migration"
+  ]
+}

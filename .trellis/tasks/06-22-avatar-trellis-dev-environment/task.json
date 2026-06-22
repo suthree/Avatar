@@ -1,0 +1,23 @@
+{
+  "id": "06-22-avatar-trellis-dev-environment",
+  "title": "Initialize Avatar Trellis workflow and development environment rules",
+  "type": "docs-governance",
+  "status": "done",
+  "risk": "low",
+  "created_at": "2026-06-22",
+  "sources": [
+    "user request on Avatar self-iteration",
+    "docs/GA_CODEX_LOOP.md",
+    "frontends/aegis_mesh_sessions.py",
+    "frontends/aegis_mesh_ledger.py",
+    "frontends/aegis_mesh_webgui.py",
+    "memory/memory_management_sop.md"
+  ],
+  "acceptance": [
+    "Avatar has a Trellis workflow entrypoint",
+    "Avatar has basic development environment rules in Trellis",
+    "Aegis Mesh workflow rules are captured as executable agent guidance",
+    "The current work is recorded as a Trellis task",
+    "No runtime code behavior is changed"
+  ]
+}

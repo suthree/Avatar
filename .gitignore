@@ -149,3 +149,16 @@ frontends/conductor_im_plugins/config.local.json
 # Project Mode SOP
 !memory/project_mode_sop.md
 
+# Trellis: track shared workflow/spec/task files, ignore local runtime state.
+!.trellis/
+!.trellis/config.yaml
+!.trellis/workflow.md
+!.trellis/spec/
+!.trellis/spec/**
+!.trellis/tasks/
+!.trellis/tasks/**
+!.trellis/scripts/
+!.trellis/scripts/**
+.trellis/workspace/
+.trellis/.developer/
+.trellis/.runtime/
