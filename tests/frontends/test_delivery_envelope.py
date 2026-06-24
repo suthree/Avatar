@@ -221,6 +221,49 @@ class FeishuDeliveryIntegrationTests(unittest.TestCase):
         self.assertIn("detail-11", latest)
         self.assertIn("/full task-many-steps", latest)
 
+
+    def test_feishu_post_payload_wraps_markdown_and_code_blocks(self):
+        fsapp = _import_fsapp()
+        payload = json.loads(fsapp._post("# 标题\n\n正文 before\n```python\nprint(1)\n```\n正文 after"))
+        rows = payload["zh_cn"]["content"]
+
+        self.assertGreaterEqual(len(rows), 3)
+        self.assertTrue(all(row and row[0]["tag"] == "md" for row in rows))
+        self.assertIn("# 标题", rows[0][0]["text"])
+        self.assertIn("```python", rows[1][0]["text"])
+        self.assertIn("正文 after", rows[-1][0]["text"])
+
+    def test_feishu_send_text_uses_post_rich_text(self):
+        fsapp = _import_fsapp()
+
+        class DummySessionManager:
+            pass
+
+        calls = []
+
+        def fake_send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
+            calls.append({
+                "receive_id": receive_id,
+                "content": content,
+                "msg_type": msg_type,
+                "use_card": use_card,
+                "receive_id_type": receive_id_type,
+            })
+            return "mid-rich"
+
+        old = fsapp.send_message
+        fsapp.send_message = fake_send_message
+        try:
+            app = fsapp.FeishuApp(DummySessionManager())
+            asyncio.run(app.send_text("chat-1", "**bold**\n\n```python\nprint(1)\n```"))
+        finally:
+            fsapp.send_message = old
+
+        self.assertTrue(calls)
+        self.assertTrue(all(call["msg_type"] == "post" for call in calls))
+        self.assertTrue(all(call["use_card"] is False for call in calls))
+        self.assertIn("**bold**", calls[0]["content"])
+
     def test_retrieval_commands_are_listed_in_help(self):
         fsapp = _import_fsapp()
         self.assertIn("/full [task_id]", fsapp._FEISHU_HELP_TEXT)

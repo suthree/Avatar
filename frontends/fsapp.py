@@ -183,6 +183,53 @@ def _segment_for_im(text, limit):
     return segment_markdown(sanitize_for_im(text), limit=limit)
 
 
+def _build_markdown_post_rows(content):
+    """Build Feishu post rows from Markdown, isolating fenced code blocks.
+
+    Feishu `text` messages do not render Markdown.  Hermes-agent sends
+    Feishu rich text as msg_type=post with `md` elements; split around
+    fenced code blocks so a large md element cannot swallow following prose.
+    """
+    text = sanitize_for_im(content)
+    if not text:
+        return [[{"tag": "md", "text": ""}]]
+    if "```" not in text:
+        return [[{"tag": "md", "text": text}]]
+
+    rows = []
+    current = []
+    in_code_block = False
+
+    def flush_current():
+        nonlocal current
+        if not current:
+            return
+        segment = "\n".join(current)
+        if segment.strip():
+            rows.append([{"tag": "md", "text": segment}])
+        current = []
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        is_fence = stripped.startswith("```")
+        if is_fence and not in_code_block:
+            flush_current()
+            current.append(raw_line)
+            in_code_block = True
+            continue
+        current.append(raw_line)
+        if is_fence and in_code_block:
+            flush_current()
+            in_code_block = False
+
+    flush_current()
+    return rows or [[{"tag": "md", "text": text}]]
+
+
+def _post(text):
+    return json.dumps({"zh_cn": {"content": _build_markdown_post_rows(text)}}, ensure_ascii=False)
+
+
 def _to_allowed_set(value):
     if value is None:
         return set()
@@ -508,13 +555,20 @@ def _patch_card(message_id, card_json):
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
     if use_card:
         return _send_raw(receive_id, _card(content), "interactive", receive_id_type)
+    if msg_type == "post":
+        sent = _send_raw(receive_id, _post(content), "post", receive_id_type)
+        if sent:
+            return sent
+        # Best-effort compatibility fallback: preserve deliverability if Feishu
+        # rejects rich text for an unexpected account/client constraint.
+        return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
     if msg_type == "text":
         return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
     return _send_raw(receive_id, content, msg_type, receive_id_type)
 
 
 def _send_report_message(receive_id, content, receive_id_type="open_id"):
-    return send_message(receive_id, content, "text", False, receive_id_type)
+    return send_message(receive_id, content, "post", False, receive_id_type)
 
 
 def _log_reporter_error(exc):
@@ -912,7 +966,7 @@ class FeishuApp(AgentChatMixin):
     async def send_text(self, chat_id, content, *, receive_id=None, receive_id_type="open_id", **_):
         rid = receive_id or chat_id
         for part in _segment_for_im(content, self.split_limit):
-            await asyncio.to_thread(send_message, rid, part, "text", False, receive_id_type)
+            await asyncio.to_thread(send_message, rid, part, "post", False, receive_id_type)
 
     async def send_done(self, chat_id, raw_text, *, receive_id=None, receive_id_type="open_id", session_id=None, **_):
         rid = receive_id or chat_id
