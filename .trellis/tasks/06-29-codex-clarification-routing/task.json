@@ -1,0 +1,23 @@
+{
+  "id": "06-29-codex-clarification-routing",
+  "title": "Test Hermes-Codex clarification routing with public skills",
+  "type": "workflow-docs",
+  "status": "done",
+  "risk": "low",
+  "created_at": "2026-06-29",
+  "sources": [
+    "user request in Feishu",
+    "https://github.com/suthree/Avatar/issues/16",
+    "docs/GA_CODEX_LOOP.md",
+    ".trellis/workflow.md",
+    ".trellis/spec/codex-goal-contract.md",
+    ".trellis/spec/aegis-mesh-workflow.md"
+  ],
+  "acceptance": [
+    "Avatar workflow docs/specs describe who uses grill-me-style clarification skills",
+    "Codex goal contract includes BLOCKED_QUESTION format",
+    "Routing rule distinguishes Hermes-answerable, Codex-autonomous, and user-required questions",
+    "Docs-only workflow proof is recorded without runtime behavior changes",
+    "Verification records documentation checks and avoids secrets/runtime local files"
+  ]
+}
