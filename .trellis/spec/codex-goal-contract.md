@@ -43,3 +43,30 @@ Required sections:
 ```
 
 A task is not ready for Codex if the goal requires guessing user intent, secret access, production approval, or repo boundaries.
+
+## Clarification and Blocked Questions
+
+Codex is the coding worker, not the user-facing coordinator. Codex must not ask the user directly. If Codex uses clarification-oriented skills to sharpen requirements, it uses them internally against the provided repository, docs, task context, and acceptance criteria.
+
+For low-risk implementation or documentation wording choices, Codex may proceed autonomously when the goal contract gives enough context. The handoff must record the choice and why it was low risk.
+
+For a genuine ambiguity that blocks safe completion, Codex must stop and include this exact structured section in its handoff:
+
+```text
+BLOCKED_QUESTION
+context:
+question:
+options:
+recommendation:
+impact:
+```
+
+Field meanings:
+
+- `context:` the repo, task, file, behavior, or acceptance criterion that created the ambiguity.
+- `question:` the smallest decision needed to unblock safe work.
+- `options:` concrete alternatives Hermes/Avatar can choose from or forward to the user.
+- `recommendation:` Codex's recommended option, if one is defensible from the available context.
+- `impact:` what changes, risk, delay, or verification burden follows from each likely answer.
+
+Hermes/Avatar decides whether to answer from repo/docs/context, instruct Codex to proceed autonomously, or forward product/risk decisions to the user.

@@ -10,12 +10,33 @@ IM → GA/avatar → GitHub Issue → Trellis Task → Codex /goal → PR → CI
 
 Role boundaries:
 
-- **GA/avatar** is the personal controller, external observer, learner, and dispatcher.
+- **GA/avatar** is the personal controller, user-facing clarification owner, final routing decision maker, external observer, learner, and dispatcher.
 - **Codex** is the complete coding-task executor.
 - **GitHub Issue + Trellis Task** are the task fact source: intent, state, evidence, decisions, and follow-up items should be recoverable there.
 - **Memory** keeps durable personal/repo operating knowledge only after it is verified by executed actions.
 
 GA/avatar should not continuously micro-manage Codex implementation steps. GA/avatar prepares the contract, observes artifacts, audits completion, and consolidates learning.
+
+### 0.1 Clarification Routing
+
+Hermes/Avatar owns user-facing clarification and final routing decisions. Codex must not ask the user directly, including when it uses clarification-oriented skills for requirement sharpness.
+
+When Codex can safely continue with a low-risk implementation or documentation wording choice, it proceeds autonomously and records the choice in its handoff. When Codex finds a genuine ambiguity that blocks safe completion, it writes a structured `BLOCKED_QUESTION` in the handoff instead of asking the user:
+
+```text
+BLOCKED_QUESTION
+context:
+question:
+options:
+recommendation:
+impact:
+```
+
+Hermes/Avatar routes the question in one of three ways:
+
+1. Answer directly from repository, docs, task context, or verified memory.
+2. Confirm that Codex should proceed autonomously for a low-risk implementation choice.
+3. Forward product, risk, approval, or user-preference decisions to the user, then record the answer in the task fact source.
 
 ## 1. Demand Intake → Codex Goal
 

@@ -47,6 +47,18 @@ Use these phase names for task metadata and board grouping:
 
 The board also groups blocked tasks as `blocked/requires_user`, completed tasks as `done/completed`, and terminal failures as `failed/stopped`.
 
+## Clarification Routing Outcomes
+
+Hermes/Avatar is the user-facing coordinator for clarification routing. Codex records ambiguity in artifacts; it does not directly ask the user.
+
+When Codex emits a `BLOCKED_QUESTION`, Hermes/Avatar classifies it into one of three outcomes:
+
+1. `avatar_answered`: Hermes/Avatar answers directly from repository, docs, Trellis task context, GitHub issue context, or verified memory.
+2. `codex_autonomous`: Hermes/Avatar confirms the decision is a low-risk implementation choice and Codex may proceed with the documented recommendation.
+3. `requires_user`: Hermes/Avatar forwards product decisions, risk acceptance, approvals, or user-preference questions to the user before Codex continues.
+
+Only the third outcome should be shown or grouped as `blocked/requires_user`. The first two outcomes should be recorded in the task or handoff as coordinator decisions, not treated as user blockers.
+
 ## Health Signals
 
 Avatar must investigate before marking a task done when the board indicates:
