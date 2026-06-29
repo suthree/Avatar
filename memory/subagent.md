@@ -3,7 +3,7 @@
 ## 文件IO协议
 
 - 目录：`temp/{task_name}/`（cwd在temp/时即`./{task_name}/`）
-- 启动：`python agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根）
+- 启动：`python3 agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根；本环境未必有`python`别名）
 - `--input`自动建目录+清旧output+写input.txt；长文本先手动写input.txt再启动(不带--input)
 - 自动后台启动，print PID then exit
 - 统一设定：所有agent的cwd都是temp，方便文件共享，不是task目录

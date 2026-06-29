@@ -111,10 +111,14 @@ _FEISHU_HELP_TEXT = chat_common.HELP_TEXT + "\n/report - 立即发送当前会�
 
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 MEDIA_DIR = os.path.join(TEMP_DIR, "feishu_media")
+OUTPUT_DIR = os.path.join(TEMP_DIR, "feishu_outputs")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 _TRUNC_TAIL = 300  # 截断兜底时保留原文尾部字符数
+_TASKCARD_FINAL_PREVIEW_LIMIT = 1200
+_FEISHU_INLINE_RESULT_LIMIT = 12000
 _DEDUP_TTL_SEC = 10 * 60
 _DEDUP_MAX = 2000
 _DEDUP_LOCK = threading.Lock()
@@ -166,6 +170,25 @@ def _result_summary(text, max_len=240):
     if len(summary) <= max_len:
         return summary
     return summary[: max_len - 1].rstrip() + "…"
+
+
+def _final_preview_text(text, max_len=_TASKCARD_FINAL_PREVIEW_LIMIT):
+    body = _display_text(text).strip() or "_(无文本输出)_"
+    if len(body) <= max_len:
+        return body
+    return body[: max_len - 1].rstrip() + f"…\n\n（完整结果已作为后续文本消息发送；预览 {max_len} 字）"
+
+
+def _write_feishu_output(raw_text, prefix="feishu_result"):
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    name = f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}.md"
+    path = os.path.join(OUTPUT_DIR, name)
+    body = _display_text(raw_text).strip() or "_(无文本输出)_"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+        if not body.endswith("\n"):
+            f.write("\n")
+    return path
 
 
 def _to_allowed_set(value):
@@ -650,6 +673,20 @@ def _send_generated_files(receive_id, raw_text, receive_id_type="open_id"):
         _send_local_file(receive_id, file_path, receive_id_type)
 
 
+def _send_final_result_text(receive_id, raw_text, receive_id_type="open_id"):
+    body = _display_text(raw_text).strip() or "_(无文本输出)_"
+    saved_path = None
+    if len(body) > _FEISHU_INLINE_RESULT_LIMIT:
+        saved_path = _write_feishu_output(raw_text)
+        intro = f"✅ 完整结果较长（{len(body)} 字），已保存到 [FILE:{saved_path}]；下面发送文本分片："
+        send_message(receive_id, intro, receive_id_type=receive_id_type)
+    else:
+        send_message(receive_id, "✅ 完整结果：", receive_id_type=receive_id_type)
+    for part in split_text(body, 3800):
+        send_message(receive_id, part, receive_id_type=receive_id_type)
+    return saved_path
+
+
 def _build_user_message(message):
     msg_type = message.message_type
     message_id = message.message_id
@@ -763,11 +800,14 @@ class _TaskCard:
         self.status = f"⏳ 工作中 · 步骤 {len(self.steps)}"
         self._push()
 
-    def done(self, text):
+    def done(self, text, *, result_note=None):
         self.status = "✅ 已完成"
-        self.final = text or "_(无文本输出)_"
+        preview = _final_preview_text(text)
+        if result_note:
+            preview = f"{preview}\n\n{result_note}"
+        self.final = preview or "_(无文本输出)_"
         if not self._push():
-            self._fallback_text(_display_text(text), final=True)
+            self._fallback_text(self.final, final=True)
 
     def fail(self, msg, detail=None):
         self.status = f"❌ {msg}"
@@ -928,7 +968,14 @@ class FeishuApp(AgentChatMixin):
                 return
             result["raw"] = raw
             self.session_manager.complete_task(mesh_session_id, task_id, result_summary=_result_summary(raw))
-            card.done(f"{_task_status_text()}\n\n结果:\n{_display_text(raw)}")
+            body = _display_text(raw).strip() or "_(无文本输出)_"
+            result_note = f"会话状态:\n{_task_status_text()}\n\n完整结果将以普通文本分片发送。"
+            if len(body) > _FEISHU_INLINE_RESULT_LIMIT:
+                result_note += f"\n结果较长（{len(body)} 字），同时保存到本机文件。"
+            card.done(raw, result_note=result_note)
+            saved_path = _send_final_result_text(rid, raw, receive_id_type=receive_id_type)
+            if saved_path:
+                _send_local_file(rid, saved_path, receive_id_type)
             _send_generated_files(rid, raw, receive_id_type=receive_id_type)
 
         def _record_progress(summary):
