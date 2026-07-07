@@ -1,0 +1,25 @@
+{
+  "id": "07-07-fuxi-workflow-skill",
+  "title": "Import latest FuXi workflow as Avatar skill",
+  "type": "workflow-docs",
+  "status": "done",
+  "risk": "low",
+  "created_at": "2026-07-07",
+  "sources": [
+    "user request in Feishu",
+    "/root/.hermes/skills/software-development/fuxi-state-reporting/SKILL.md",
+    "/root/.hermes/skills/software-development/fuxi-state-reporting/references/branch-normalization-and-uat-closure.md",
+    "/root/.hermes/skills/software-development/fuxi-state-reporting/references/baize-branch-baseline-cleanup.md",
+    "/root/.hermes/skills/autonomous-ai-agents/coding-agent-orchestration/references/fuxi-codex-tool-sop-layer.md",
+    "docs/GA_CODEX_LOOP.md",
+    ".trellis/workflow.md",
+    "memory_management_sop.md"
+  ],
+  "acceptance": [
+    "Latest Hermes FuXi state-reporting workflow is available as a tracked Avatar memory skill",
+    "Recent branch/UAT closure and BaiZe baseline cleanup references are included",
+    "Codex Tool SOP layer lesson is included without changing runtime behavior",
+    "Trellis task records source, verification, and docs-only nature of the import",
+    "No secrets, one-off logs, or runtime local state are committed"
+  ]
+}
