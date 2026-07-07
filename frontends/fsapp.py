@@ -89,7 +89,10 @@ from frontends.aegis_mesh_sessions import (
     render_periodic_report_text,
     render_session_status_text,
 )
-from frontends.chatapp_common import AgentChatMixin, FILE_HINT, split_text
+from frontends.chatapp_common import AgentChatMixin, FILE_HINT
+from frontends.message_delivery import build_delivery_envelope, render_artifact_index, render_feishu_digest
+from frontends.outbox_store import read_chunk, read_full, read_manifest, write_artifact
+from frontends.platform_budgets import build_digest, sanitize_for_im, segment_markdown
 
 _TAG_PATS = [r"<" + t + r">.*?</" + t + r">" for t in ("thinking", "summary", "tool_use", "file_content")]
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
@@ -107,7 +110,15 @@ _FILE_TYPE_MAP = {
     ".pptx": "ppt",
 }
 _MSG_TYPE_MAP = {"image": "[image]", "audio": "[audio]", "file": "[file]", "media": "[media]", "sticker": "[sticker]"}
-_FEISHU_HELP_TEXT = chat_common.HELP_TEXT + "\n/report - 立即发送当前会话摘要\n/summary - 同上"
+_FEISHU_HELP_TEXT = (
+    chat_common.HELP_TEXT
+    + "\n/report - 立即发送当前会话摘要"
+    + "\n/summary - 同上"
+    + "\n/full [task_id] - 取回最近任务或指定任务的完整输出"
+    + "\n/chunk [task_id] <n> - 取回指定输出分片"
+    + "\n/artifacts [task_id] - 查看任务产物索引"
+    + "\n/more - 取回最近任务的下一个分片"
+)
 
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 MEDIA_DIR = os.path.join(TEMP_DIR, "feishu_media")
@@ -172,23 +183,55 @@ def _result_summary(text, max_len=240):
     return summary[: max_len - 1].rstrip() + "…"
 
 
-def _final_preview_text(text, max_len=_TASKCARD_FINAL_PREVIEW_LIMIT):
-    body = _display_text(text).strip() or "_(无文本输出)_"
-    if len(body) <= max_len:
-        return body
-    return body[: max_len - 1].rstrip() + f"…\n\n（完整结果已作为后续文本消息发送；预览 {max_len} 字）"
+def _segment_for_im(text, limit):
+    return segment_markdown(sanitize_for_im(text), limit=limit)
 
 
-def _write_feishu_output(raw_text, prefix="feishu_result"):
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    name = f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}.md"
-    path = os.path.join(OUTPUT_DIR, name)
-    body = _display_text(raw_text).strip() or "_(无文本输出)_"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(body)
-        if not body.endswith("\n"):
-            f.write("\n")
-    return path
+def _build_markdown_post_rows(content):
+    """Build Feishu post rows from Markdown, isolating fenced code blocks.
+
+    Feishu `text` messages do not render Markdown.  Hermes-agent sends
+    Feishu rich text as msg_type=post with `md` elements; split around
+    fenced code blocks so a large md element cannot swallow following prose.
+    """
+    text = sanitize_for_im(content)
+    if not text:
+        return [[{"tag": "md", "text": ""}]]
+    if "```" not in text:
+        return [[{"tag": "md", "text": text}]]
+
+    rows = []
+    current = []
+    in_code_block = False
+
+    def flush_current():
+        nonlocal current
+        if not current:
+            return
+        segment = "\n".join(current)
+        if segment.strip():
+            rows.append([{"tag": "md", "text": segment}])
+        current = []
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        is_fence = stripped.startswith("```")
+        if is_fence and not in_code_block:
+            flush_current()
+            current.append(raw_line)
+            in_code_block = True
+            continue
+        current.append(raw_line)
+        if is_fence and in_code_block:
+            flush_current()
+            in_code_block = False
+
+    flush_current()
+    return rows or [[{"tag": "md", "text": text}]]
+
+
+def _post(text):
+    return json.dumps({"zh_cn": {"content": _build_markdown_post_rows(text)}}, ensure_ascii=False)
 
 
 def _to_allowed_set(value):
@@ -373,6 +416,8 @@ reporter_lock = threading.Lock()
 
 
 def _load_config():
+    if os.environ.get("AVATAR_SKIP_CONFIG_LOAD") == "1":
+        return {}, ""
     path = _resolve_mykey_path()
     if not path or not path.exists():
         return {}, str(path or "")
@@ -514,13 +559,20 @@ def _patch_card(message_id, card_json):
 def send_message(receive_id, content, msg_type="text", use_card=False, receive_id_type="open_id"):
     if use_card:
         return _send_raw(receive_id, _card(content), "interactive", receive_id_type)
+    if msg_type == "post":
+        sent = _send_raw(receive_id, _post(content), "post", receive_id_type)
+        if sent:
+            return sent
+        # Best-effort compatibility fallback: preserve deliverability if Feishu
+        # rejects rich text for an unexpected account/client constraint.
+        return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
     if msg_type == "text":
         return _send_raw(receive_id, json.dumps({"text": content}, ensure_ascii=False), "text", receive_id_type)
     return _send_raw(receive_id, content, msg_type, receive_id_type)
 
 
 def _send_report_message(receive_id, content, receive_id_type="open_id"):
-    return send_message(receive_id, content, "text", False, receive_id_type)
+    return send_message(receive_id, content, "post", False, receive_id_type)
 
 
 def _log_reporter_error(exc):
@@ -538,7 +590,7 @@ def start_aegis_periodic_reporter(interval_sec=None):
             periodic_reporter = AegisMeshPeriodicReporter(
                 get_session_manager(),
                 send_fn=_send_report_message,
-                split_fn=split_text,
+                split_fn=_segment_for_im,
                 interval_sec=interval,
                 on_error=_log_reporter_error,
             )
@@ -745,9 +797,13 @@ def _build_step_detail(resp, tool_calls):
 class _TaskCard:
     """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
     _DETAIL_LIMIT = 8000
+    _MAX_VISIBLE_STEPS = 8
 
-    def __init__(self, receive_id, rid_type):
+    def __init__(self, receive_id, rid_type, *, task_id=None, outbox_dir=None, session=None):
         self.rid, self.rtype = receive_id, rid_type
+        self.task_id = task_id or f"fs_card_{uuid.uuid4().hex}"
+        self.outbox_dir = outbox_dir
+        self.session = dict(session or {})
         self.steps = []          # [(summary, detail), ...]
         self.status = "🤔 思考中..."
         self.final = None
@@ -755,20 +811,79 @@ class _TaskCard:
         self.start_fallback_sent = False
         self.final_fallback_sent = False
 
+    def _step_detail_notice(self, idx, summary, detail):
+        digest = build_digest(detail, budget=1200)
+        try:
+            saved = write_artifact(
+                self.task_id,
+                f"step_{idx}_detail",
+                detail,
+                kind="task_step_detail",
+                status=self.status,
+                session=self.session,
+                metadata={"summary": summary, "step": idx},
+                omitted_section={"section": "task_card_step", "step": idx, "summary": summary},
+                base_dir=self.outbox_dir,
+            )
+            artifact = saved["artifact"]
+            return (
+                "步骤详情较长，完整内容已保存到本地 outbox。\n\n"
+                f"{digest}\n\n"
+                f"任务: `{self.task_id}`\n"
+                f"详情: `{artifact['path']}` ({artifact['chars']} 字符)\n"
+                f"索引: `/artifacts {self.task_id}`\n"
+                f"全文: `/full {self.task_id}`；分片: `/chunk {self.task_id} <n>`；继续: `/more`"
+            )
+        except Exception as exc:
+            return (
+                f"步骤详情较长，但写入 outbox 失败: {exc}\n\n"
+                f"{digest}\n\n"
+                "请检查本地 outbox 配置后重试。"
+            )
+
+    def _prepare_step_detail(self, summary, detail):
+        detail = detail or "_(无输出)_"
+        if len(detail) <= self._DETAIL_LIMIT:
+            return detail
+        return self._step_detail_notice(len(self.steps) + 1, summary, detail)
+
     def _step_panel(self, idx, summary, detail):
         detail = detail or "_(无输出)_"
         if len(detail) > self._DETAIL_LIMIT:
-            detail = detail[:self._DETAIL_LIMIT] + f"\n\n…(已截断,共 {len(detail)} 字符)"
+            detail = (
+                build_digest(detail, budget=1200)
+                + f"\n\n任务: `{self.task_id}`\n索引: `/artifacts {self.task_id}`"
+            )
         return {
             "tag": "collapsible_panel", "expanded": False,
             "header": {"title": {"tag": "plain_text", "content": f"步骤 {idx} · {summary}"}},
             "elements": [{"tag": "markdown", "content": detail}],
         }
 
+    def _visible_steps(self):
+        if len(self.steps) <= self._MAX_VISIBLE_STEPS:
+            return 0, self.steps
+        hidden = len(self.steps) - self._MAX_VISIBLE_STEPS
+        return hidden, self.steps[-self._MAX_VISIBLE_STEPS:]
+
     def _build(self):
         els = [{"tag": "markdown", "content": f"**{self.status}**"}]
-        for i, (s, d) in enumerate(self.steps, 1):
-            els.append(self._step_panel(i, s, d))
+        hidden, visible_steps = self._visible_steps()
+        if hidden:
+            els.append({
+                "tag": "note",
+                "elements": [{
+                    "tag": "plain_text",
+                    "content": (
+                        f"已折叠 {hidden} 个较早步骤以控制飞书卡片大小。"
+                        f"当前卡片仅展示最近 {len(visible_steps)} 步；"
+                        f"完整最终输出见 /full {self.task_id}，外置详情见 /artifacts {self.task_id}。"
+                    ),
+                }],
+            })
+        start_index = hidden + 1
+        for offset, (summary, detail) in enumerate(visible_steps):
+            els.append(self._step_panel(start_index + offset, summary, detail))
         if self.final:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
         return _card_raw(els)
@@ -796,7 +911,7 @@ class _TaskCard:
             self._fallback_text("🤔 思考中...")
 
     def step(self, summary, detail=""):
-        self.steps.append((summary, detail))
+        self.steps.append((summary, self._prepare_step_detail(summary, detail)))
         self.status = f"⏳ 工作中 · 步骤 {len(self.steps)}"
         self._push()
 
@@ -844,24 +959,123 @@ def _make_task_hook(card, task_id, on_final, on_progress=None):
 class FeishuApp(AgentChatMixin):
     label, source, split_limit = "Feishu", "feishu", 4000
 
-    def __init__(self, session_manager):
+    def __init__(self, session_manager, *, outbox_dir=None):
         self.session_manager = session_manager
         self.agent = None
         self.user_tasks = {}
+        self.outbox_dir = outbox_dir
+        self._recent_task_ids = {}
+        self._more_cursors = {}
 
     def _session_id(self, chat_id, session_id=None):
         return session_id or chat_id
 
+    def _remember_task(self, mesh_session_id, task_id):
+        self._recent_task_ids[mesh_session_id] = task_id
+        self._more_cursors.setdefault(mesh_session_id, {"task_id": task_id, "next_chunk": 1})
+        if self._more_cursors[mesh_session_id].get("task_id") != task_id:
+            self._more_cursors[mesh_session_id] = {"task_id": task_id, "next_chunk": 1}
+
+    def _recent_task_id(self, mesh_session_id):
+        return self._recent_task_ids.get(mesh_session_id)
+
+    def _task_arg_or_recent(self, mesh_session_id, parts, *, index=1):
+        if len(parts) > index:
+            return parts[index]
+        return self._recent_task_id(mesh_session_id)
+
     async def send_text(self, chat_id, content, *, receive_id=None, receive_id_type="open_id", **_):
         rid = receive_id or chat_id
-        for part in split_text(content, self.split_limit):
-            await asyncio.to_thread(send_message, rid, part, "text", False, receive_id_type)
+        for part in _segment_for_im(content, self.split_limit):
+            await asyncio.to_thread(send_message, rid, part, "post", False, receive_id_type)
 
-    async def send_done(self, chat_id, raw_text, *, receive_id=None, receive_id_type="open_id", **_):
+    async def send_done(self, chat_id, raw_text, *, receive_id=None, receive_id_type="open_id", session_id=None, **_):
         rid = receive_id or chat_id
         text = _display_text(raw_text)
-        await asyncio.to_thread(send_message, rid, text, "text", False, receive_id_type)
+        mesh_session_id = self._session_id(chat_id, session_id)
+        task_id = f"{mesh_session_id}_{uuid.uuid4().hex}"
+        envelope = await asyncio.to_thread(
+            build_delivery_envelope,
+            task_id,
+            text,
+            raw_text=raw_text,
+            status="done",
+            session={"id": mesh_session_id, "receive_id_type": receive_id_type},
+            metadata={"source": self.source, "entrypoint": "send_done"},
+            base_dir=self.outbox_dir,
+        )
+        self._remember_task(mesh_session_id, task_id)
+        await self.send_text(chat_id, render_feishu_digest(envelope), receive_id=rid, receive_id_type=receive_id_type)
         await asyncio.to_thread(_send_generated_files, rid, raw_text, receive_id_type)
+
+    async def _handle_full_command(self, chat_id, mesh_session_id, parts, **ctx):
+        task_id = self._task_arg_or_recent(mesh_session_id, parts)
+        if not task_id:
+            return await self.send_text(chat_id, "没有最近任务。用法: /full <task_id>", **ctx)
+        try:
+            manifest, text = read_full(task_id, base_dir=self.outbox_dir)
+        except Exception as exc:
+            return await self.send_text(chat_id, f"❌ 无法读取完整输出 `{task_id}`: {exc}", **ctx)
+        self._remember_task(mesh_session_id, task_id)
+        self._more_cursors[mesh_session_id] = {"task_id": task_id, "next_chunk": len(manifest.get("chunks") or []) + 1}
+        header = f"Full output for `{task_id}` ({manifest.get('full', {}).get('chars', len(text))} chars):\n\n"
+        return await self.send_text(chat_id, header + text, **ctx)
+
+    def _parse_chunk_args(self, mesh_session_id, parts):
+        if len(parts) == 2 and parts[1].isdigit():
+            return self._recent_task_id(mesh_session_id), int(parts[1])
+        if len(parts) >= 3 and parts[2].isdigit():
+            return parts[1], int(parts[2])
+        return None, None
+
+    async def _handle_chunk_command(self, chat_id, mesh_session_id, parts, **ctx):
+        task_id, index = self._parse_chunk_args(mesh_session_id, parts)
+        if not task_id or not index:
+            return await self.send_text(chat_id, "用法: /chunk [task_id] <n>", **ctx)
+        try:
+            manifest, text, _entry = read_chunk(task_id, index, base_dir=self.outbox_dir)
+        except Exception as exc:
+            return await self.send_text(chat_id, f"❌ 无法读取分片 `{task_id}` #{index}: {exc}", **ctx)
+        chunks = manifest.get("chunks") or []
+        self._remember_task(mesh_session_id, task_id)
+        self._more_cursors[mesh_session_id] = {"task_id": task_id, "next_chunk": index + 1}
+        header = f"Chunk {index}/{len(chunks)} for `{task_id}`:\n\n"
+        return await self.send_text(chat_id, header + text, **ctx)
+
+    async def _handle_artifacts_command(self, chat_id, mesh_session_id, parts, **ctx):
+        task_id = self._task_arg_or_recent(mesh_session_id, parts)
+        if not task_id:
+            return await self.send_text(chat_id, "没有最近任务。用法: /artifacts <task_id>", **ctx)
+        try:
+            manifest = read_manifest(task_id, base_dir=self.outbox_dir)
+        except Exception as exc:
+            return await self.send_text(chat_id, f"❌ 无法读取产物索引 `{task_id}`: {exc}", **ctx)
+        self._remember_task(mesh_session_id, task_id)
+        return await self.send_text(chat_id, render_artifact_index(manifest), **ctx)
+
+    async def _handle_more_command(self, chat_id, mesh_session_id, **ctx):
+        cursor = self._more_cursors.get(mesh_session_id)
+        if not cursor:
+            task_id = self._recent_task_id(mesh_session_id)
+            if not task_id:
+                return await self.send_text(chat_id, "没有最近任务。用法: /chunk <n> 或 /full <task_id>", **ctx)
+            cursor = {"task_id": task_id, "next_chunk": 1}
+        task_id = cursor["task_id"]
+        index = int(cursor.get("next_chunk") or 1)
+        try:
+            manifest = read_manifest(task_id, base_dir=self.outbox_dir)
+        except Exception as exc:
+            return await self.send_text(chat_id, f"❌ 无法读取任务 `{task_id}`: {exc}", **ctx)
+        chunks = manifest.get("chunks") or []
+        if index > len(chunks):
+            return await self.send_text(chat_id, f"任务 `{task_id}` 没有更多分片。", **ctx)
+        try:
+            _manifest, text, _entry = read_chunk(task_id, index, base_dir=self.outbox_dir)
+        except Exception as exc:
+            return await self.send_text(chat_id, f"❌ 无法读取分片 `{task_id}` #{index}: {exc}", **ctx)
+        self._more_cursors[mesh_session_id] = {"task_id": task_id, "next_chunk": index + 1}
+        header = f"Chunk {index}/{len(chunks)} for `{task_id}`:\n\n"
+        return await self.send_text(chat_id, header + text, **ctx)
 
     async def handle_command(self, chat_id, cmd, *, session_id=None, **ctx):
         mesh_session_id = self._session_id(chat_id, session_id)
@@ -888,6 +1102,14 @@ class FeishuApp(AgentChatMixin):
                 ),
                 **ctx,
             )
+        if op == "/full":
+            return await self._handle_full_command(chat_id, mesh_session_id, parts, **ctx)
+        if op == "/chunk":
+            return await self._handle_chunk_command(chat_id, mesh_session_id, parts, **ctx)
+        if op == "/artifacts":
+            return await self._handle_artifacts_command(chat_id, mesh_session_id, parts, **ctx)
+        if op == "/more":
+            return await self._handle_more_command(chat_id, mesh_session_id, **ctx)
 
         state = self.session_manager.get_or_create(mesh_session_id, label=chat_id)
         agent = state.agent
@@ -946,7 +1168,9 @@ class FeishuApp(AgentChatMixin):
         agent = state.agent
         rid = receive_id or chat_id
         hook_key = f"fs_{task_id}"
-        card = _TaskCard(rid, receive_id_type)
+        session_meta = {"id": mesh_session_id, "chat_id": chat_id, "receive_id": rid, "receive_id_type": receive_id_type}
+        self._remember_task(mesh_session_id, task_id)
+        card = _TaskCard(rid, receive_id_type, task_id=task_id, outbox_dir=self.outbox_dir, session=session_meta)
         result = {"raw": None, "sent": False}
         finish_lock = threading.Lock()
 
@@ -967,15 +1191,20 @@ class FeishuApp(AgentChatMixin):
             if not _claim_terminal():
                 return
             result["raw"] = raw
+            full_text = _display_text(raw)
+            envelope = build_delivery_envelope(
+                task_id,
+                full_text,
+                raw_text=raw,
+                title="Feishu agent result",
+                status="done",
+                session=session_meta,
+                metadata={"source": self.source},
+                base_dir=self.outbox_dir,
+            )
+            self._remember_task(mesh_session_id, task_id)
             self.session_manager.complete_task(mesh_session_id, task_id, result_summary=_result_summary(raw))
-            body = _display_text(raw).strip() or "_(无文本输出)_"
-            result_note = f"会话状态:\n{_task_status_text()}\n\n完整结果将以普通文本分片发送。"
-            if len(body) > _FEISHU_INLINE_RESULT_LIMIT:
-                result_note += f"\n结果较长（{len(body)} 字），同时保存到本机文件。"
-            card.done(raw, result_note=result_note)
-            saved_path = _send_final_result_text(rid, raw, receive_id_type=receive_id_type)
-            if saved_path:
-                _send_local_file(rid, saved_path, receive_id_type)
+            card.done(f"{_task_status_text()}\n\n{render_feishu_digest(envelope)}")
             _send_generated_files(rid, raw, receive_id_type=receive_id_type)
 
         def _record_progress(summary):

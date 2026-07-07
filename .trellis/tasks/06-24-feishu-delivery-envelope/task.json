@@ -1,0 +1,32 @@
+{
+  "id": "06-24-feishu-delivery-envelope",
+  "title": "Implement Feishu delivery envelope for long replies",
+  "type": "feature",
+  "status": "done",
+  "risk": "medium",
+  "created_at": "2026-06-24",
+  "sources": [
+    "user request",
+    "https://github.com/suthree/Avatar/issues/14",
+    "docs/GA_CODEX_LOOP.md",
+    ".trellis/workflow.md",
+    ".trellis/spec/aegis-mesh-workflow.md",
+    ".trellis/spec/development-environment.md",
+    ".trellis/spec/personal-agent-harness.md"
+  ],
+  "acceptance": [
+    "Long Feishu/IM replies are delivered as a concise digest plus local outbox full content",
+    "Markdown-aware chunks preserve order and content without silently truncating details",
+    "Outbox manifests include checksums, chunk paths, artifact metadata, and retrieval information",
+    "Feishu commands can retrieve full output, chunks, artifacts, and recent-task continuation locally",
+    "Existing Feishu send behavior remains backward-compatible where possible",
+    "Local mocked tests cover segmentation, manifests, sanitation, digest budgets, TaskCard truncation prevention, and retrieval helpers",
+    "A handoff is written under temp/plan_feishu_delivery_envelope/codex with exact verification commands and results"
+  ],
+  "completed_at": "2026-06-24",
+  "verification": [
+    "python3 -m py_compile frontends/platform_budgets.py frontends/outbox_store.py frontends/message_delivery.py frontends/fsapp.py tests/frontends/test_delivery_envelope.py",
+    "python3 -m unittest -v tests.frontends.test_delivery_envelope (10 tests)",
+    "python3 /tmp/issue14_adversarial_corrected.py (26 adversarial checks)"
+  ]
+}
