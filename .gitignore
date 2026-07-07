@@ -84,6 +84,11 @@ memory/L4_raw_sessions/*
 # Plan SOP
 !memory/plan_sop.md
 
+# FuXi Runtime SOP
+!memory/fuxi_requirement_runtime_sop.md
+!memory/fuxi_codex_dispatch_sop.md
+!memory/fuxi_dev_workflowd_boundary_sop.md
+
 # Goal Mode SOP
 !memory/goal_mode_sop.md
 
