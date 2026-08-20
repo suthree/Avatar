@@ -11,7 +11,7 @@ workspace: /srv/datas/Avatar/production/workspace
 web:       127.0.0.1:19180
 ```
 
-The source tree must not contain `mykey.py`. The runtime config is mounted into the source tree through a local symlink and exposed to the Feishu frontend through `GA_WORKSPACE_ROOT/ga_config/mykey.py`.
+The source tree must not contain a tracked or regular `mykey.py`. At runtime, an ignored local symlink may point to the secret-side config, while the Feishu frontend resolves the same config through `GA_WORKSPACE_ROOT/ga_config/mykey.py`.
 
 ## Services
 
