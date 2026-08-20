@@ -1,4 +1,4 @@
-import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid, pathlib
+import os, json, re, time, requests, sys, threading, urllib3, base64, importlib, uuid, pathlib, copy
 from datetime import datetime
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _RESP_CACHE_KEY = str(uuid.uuid4()); _RESP_CODEX_KEY = str(uuid.uuid4())
@@ -8,7 +8,8 @@ if _ROOT not in sys.path: sys.path.append(_ROOT)
 def _load_mykeys():
     global _mykey_path
     try:
-        import mykey; importlib.reload(mykey); _mykey_path = mykey.__file__
+        sys.modules.pop('mykey', None)
+        import mykey; _mykey_path = mykey.__file__
         return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
     except ImportError as e:
         if getattr(e, 'name', None) != 'mykey':
@@ -21,13 +22,15 @@ def _load_mykeys():
     if isinstance(mk, dict) and 'remote_url' in mk: return requests.get(mk['remote_url'], timeout=10).json()
     return mk
 
+_mykey_lock = threading.Lock()
 _mykey_path = _mykey_mtime = None
 def reload_mykeys():
     global _mykey_mtime
     try:
         mt = os.stat(_mykey_path).st_mtime_ns if _mykey_path else -1
         if mt == _mykey_mtime: return globals().get('mykeys', {}), False
-        mk = _load_mykeys(); _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
+        with _mykey_lock: mk = _load_mykeys()
+        _mykey_mtime = os.stat(_mykey_path).st_mtime_ns
         print(f'[Info] Load mykeys from {_mykey_path}')
         globals().update(mykeys=mk)
         return mk, True
@@ -82,8 +85,7 @@ def _sanitize_leading_user_msg(msg):
         if not isinstance(block, dict): continue
         if block.get('type') == 'tool_result':
             c = block.get('content', '')
-            if isinstance(c, list):  # content 本身也可能是 list[{type:text,text:...}]
-                texts.extend(b.get('text', '') for b in c if isinstance(b, dict))
+            if isinstance(c, list): texts.extend(b.get('text', '') for b in c if isinstance(b, dict))
             else: texts.append(str(c))
         elif block.get('type') == 'text': texts.append(block.get('text', ''))
     msg['content'] = [{"type": "text", "text": '\n'.join(t for t in texts if t)}]
@@ -95,20 +97,32 @@ def safeprint(*argv):
     except OSError: pass
 print = safeprint
 
+STATS = {}
+
 def trim_messages_history(history, sess):
     cap = sess.context_win * 3
     target = int(cap * getattr(sess, 'trim_keep_rate', 0.6))
-    def cost(): return sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
-    compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 5))
-    print(f'[Debug] Current context: {cost()} chars, {len(history)} messages.')
-    if cost() <= cap: return
+    kp = sess.trim_keep_prefix
+    def cost(ms): return sum(len(json.dumps(m, ensure_ascii=False)) for m in ms)
+    compress_history_tags(history, interval=getattr(sess, 'cut_msg_interval', 7))
+    STATS.update(ctx=(c := cost(history)), msgs=len(history)); print(f'[Debug] Current context: {c} chars, {len(history)} messages.')
+    if c <= cap: return
     compress_history_tags(history, keep_recent=4, force=True)
-    if cost() <= target: return
-    while len(history) > 9 and cost() > target:
-        history.pop(0)
-        while history and history[0].get('role') != 'user': history.pop(0)
-        if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
-    print(f'[Debug] Trimmed context, current: {cost()} chars, {len(history)} messages.')
+    if cost(history) <= target: return
+    pre, post = history[:kp], history[kp:]
+    while len(post) > 9 and cost(pre) + cost(post) > target:
+        post.pop(0)
+        while post and post[0].get('role') != 'user': post.pop(0)
+        if post and post[0].get('role') == 'user': post[0] = _sanitize_leading_user_msg(post[0])
+    if kp and pre:
+        m = pre[-1]
+        if m.get('role') == 'assistant' and isinstance(m.get('content'), list):
+            m['content'] = [b for b in m['content'] if not (isinstance(b, dict) and b.get('type') == 'tool_use')] or [{"type": "text", "text": "..."}]
+        _d = lambda: [{"type": "text", "text": "..."}]
+        gap = [{"role": "assistant", "content": _d()}] if m.get('role') == 'user' else [{"role": "user", "content": _d()}, {"role": "assistant", "content": _d()}]
+        history[:] = pre + gap + post
+    else: history[:] = pre + post
+    STATS.update(ctx=(c := cost(history)), msgs=len(history)); print(f'[Debug] Trimmed context, current: {c} chars, {len(history)} messages.')
 
 def auto_make_url(base, path):
     b, p = base.rstrip('/'), path.strip('/')
@@ -117,12 +131,21 @@ def auto_make_url(base, path):
     return f"{b}/{p}" if re.search(r'/v\d+(/|$)', b) else f"{b}/v1/{p}"
 
 def _parse_claude_json(data):
+    if data.get("stop_reason") == "refusal":
+        err = "[Error: Claude refusal]"
+        yield err
+        return [{"type": "text", "text": err}]
     content_blocks = data.get("content", [])
     _record_usage(data.get("usage", {}), "messages")
     for b in content_blocks:
         if b.get("type") == "text": yield b.get("text", "")
         elif b.get("type") == "thinking": yield ""
     return content_blocks
+
+def _raise_if_retryable_overload(emsg):
+    """HTTP 200 SSE/body overload → ConnectionError so _stream_with_retry can backoff."""
+    if emsg and re.search(r'concurrency|retry later|overloaded|rate.?limit', emsg, re.I):
+        raise requests.ConnectionError(emsg)
 
 def _parse_claude_sse(resp_lines):
     """Parse Anthropic SSE stream. Yields text chunks, returns list[content_block]."""
@@ -156,7 +179,9 @@ def _parse_claude_sse(resp_lines):
                 if current_block and current_block.get("type") == "text": current_block["text"] += text
                 if text: yield text
             elif delta.get("type") == "thinking_delta":
-                if current_block and current_block.get("type") == "thinking": current_block["thinking"] += delta.get("thinking", "")
+                thinking = delta.get("thinking", "")
+                if current_block and current_block.get("type") == "thinking": current_block["thinking"] += thinking
+                if thinking: yield thinking
             elif delta.get("type") == "signature_delta":
                 if current_block and current_block.get("type") == "thinking":
                     current_block["signature"] = current_block.get("signature", "") + delta.get("signature", "")
@@ -173,15 +198,17 @@ def _parse_claude_sse(resp_lines):
             stop_reason = delta.get("stop_reason", stop_reason)
             out_usage = evt.get("usage", {})
             out_tokens = out_usage.get("output_tokens", 0)
-            if out_tokens: print(f"[Output] tokens={out_tokens} stop_reason={stop_reason}")
+            if out_tokens: STATS['out'] = out_tokens; print(f"[Output] tokens={out_tokens} stop_reason={stop_reason}")
         elif evt_type == "message_stop": got_message_stop = True
         elif evt_type == "error":
             err = evt.get("error", {})
             emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            _raise_if_retryable_overload(emsg)  # 走 _stream_with_retry，避免落到 ga 应用层
             warn = f"\n\n!!!Error: SSE {emsg}"; break
     if not warn:
         if not got_message_stop and not stop_reason: warn = "\n\n[!!! 流异常中断，未收到完整响应 !!!]"
         elif stop_reason == "max_tokens": warn = "\n\n[!!! Response truncated: max_tokens !!!]"
+        elif stop_reason == "refusal": warn = "\n\n[Error: Claude refusal]"
     if current_block:
         if current_block["type"] == "tool_use":
             try: current_block["input"] = json.loads(tool_json_buf) if tool_json_buf else {}
@@ -215,7 +242,7 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
     """
     content_text = ""
     if api_mode == "responses":
-        seen_delta = False; fc_buf = {}; current_fc_idx = None
+        seen_delta = False; fc_buf = {}; current_fc_idx = None; reasoning_text = ""
         for line in resp_lines:
             if not line: continue
             line = line.decode('utf-8', errors='replace') if isinstance(line, bytes) else line
@@ -231,6 +258,12 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             elif etype == "response.output_text.done" and not seen_delta:
                 text = evt.get("text", "")
                 if text: content_text += text; yield text
+            elif etype == "response.reasoning_text.delta":
+                delta = evt.get("delta", "")
+                if delta: reasoning_text += delta
+            elif etype == "response.reasoning_text.done":
+                text = evt.get("text", "")
+                if text: reasoning_text = text
             elif etype == "response.output_item.added":
                 item = evt.get("item", {})
                 if item.get("type") == "function_call":
@@ -246,13 +279,33 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
             elif etype == "error":
                 err = evt.get("error", {})
                 emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                _raise_if_retryable_overload(emsg)
                 if emsg: content_text += f"!!!Error: {emsg}"; yield f"!!!Error: {emsg}"
                 break
             elif etype == "response.completed":
                 usage = evt.get("response", {}).get("usage", {})
                 _record_usage(usage, api_mode)
                 break
+            elif etype == "response.incomplete":
+                # DeepSeek/OpenAI responses stream may end here (no [DONE]); treat as valid terminal,
+                # record usage and surface a truncation marker instead of an empty-response retry storm.
+                usage = (evt.get("response") or {}).get("usage", {})
+                _record_usage(usage, api_mode)
+                reason = ((evt.get("response") or {}).get("incomplete_details") or {}).get("reason", "") or "unknown"
+                if not content_text and not fc_buf:
+                    marker = f"[!!! output truncated: {reason}]"
+                    content_text += marker; yield marker
+                break
+            elif etype == "response.failed":
+                usage = (evt.get("response") or {}).get("usage", {})
+                _record_usage(usage, api_mode)
+                err = ((evt.get("response") or {}).get("error") or {})
+                emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                _raise_if_retryable_overload(emsg)
+                if emsg: content_text += f"!!!Error: {emsg}"; yield f"!!!Error: {emsg}"
+                break
         blocks = []
+        if reasoning_text: blocks.append({"type": "thinking", "thinking": reasoning_text})
         if content_text: blocks.append({"type": "text", "text": content_text})
         for idx in sorted(fc_buf):
             fc = fc_buf[idx]
@@ -304,20 +357,29 @@ def _parse_openai_sse(resp_lines, api_mode="chat_completions"):
 
 def _record_usage(usage, api_mode):
     if not usage: return
+    # 上游常显式给 null；dict.get(k, 0) 遇 null 仍返回 None，后续加法会 TypeError
+    def _i(v, default=0):
+        try:
+            return default if v is None else int(v)
+        except (TypeError, ValueError):
+            return default
     if api_mode == 'responses':
-        cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
-        inp = usage.get("input_tokens", 0); out = usage.get("output_tokens", 0)
+        cached = _i((usage.get("input_tokens_details") or {}).get("cached_tokens"))
+        inp = _i(usage.get("input_tokens")); out = _i(usage.get("output_tokens"))
         print(f"[Cache] input={inp} cached={cached}")
         if out: print(f"[Output] tokens={out}")
     elif api_mode == 'chat_completions':
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-        inp = usage.get("prompt_tokens", 0); out = usage.get("completion_tokens", 0)
+        cached = _i((usage.get("prompt_tokens_details") or {}).get("cached_tokens"))
+        inp = _i(usage.get("prompt_tokens")); out = _i(usage.get("completion_tokens"))
         print(f"[Cache] input={inp} cached={cached}")
         if out: print(f"[Output] tokens={out}")
     elif api_mode == 'messages':
-        ci, cr, inp = usage.get("cache_creation_input_tokens", 0), usage.get("cache_read_input_tokens", 0), usage.get("input_tokens", 0)
-        print(f"[Cache] input={inp} creation={ci} read={cr}")
-    
+        ci, cr, raw_inp = _i(usage.get("cache_creation_input_tokens")), _i(usage.get("cache_read_input_tokens")), _i(usage.get("input_tokens"))
+        inp, cached, out = raw_inp + ci + cr, cr, 0
+        print(f"[Cache] input={raw_inp} creation={ci} read={cr}")
+    else: return
+    STATS.update(inp=inp, cached=cached, out=out)
+
 def _parse_openai_json(data, api_mode="chat_completions"):
     blocks = []
     if api_mode == "responses":
@@ -327,11 +389,25 @@ def _parse_openai_json(data, api_mode="chat_completions"):
                 for p in (item.get("content") or []):
                     if p.get("type") in ("output_text", "text") and p.get("text"):
                         blocks.append({"type": "text", "text": p["text"]}); yield p["text"]
+            elif item.get("type") == "reasoning":
+                for p in (item.get("content") or []):
+                    if p.get("type") in ("reasoning_text", "summary_text") and p.get("text"):
+                        blocks.append({"type": "thinking", "thinking": p["text"]})
             elif item.get("type") == "function_call":
                 try: args = json.loads(item.get("arguments", "")) if item.get("arguments") else {}
                 except: args = {"_raw": item.get("arguments", "")}
                 blocks.append({"type": "tool_use", "id": item.get("call_id", item.get("id", "")),
                                "name": item.get("name", ""), "input": args})
+        status = (data.get("status") or "").lower()
+        if status == "failed":
+            err = data.get("error") or {}
+            emsg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            _raise_if_retryable_overload(emsg)
+            if emsg: blocks.append({"type": "text", "text": f"!!!Error: {emsg}"}); yield f"!!!Error: {emsg}"
+        elif status == "incomplete" and not any(b.get("type") == "text" for b in blocks):
+            reason = ((data.get("incomplete_details") or {}).get("reason", "")) or "unknown"
+            marker = f"[!!! output truncated: {reason}]"
+            blocks.append({"type": "text", "text": marker}); yield marker
     else:
         _record_usage(data.get("usage") or {}, api_mode)
         msg = (data.get("choices") or [{}])[0].get("message", {})
@@ -362,24 +438,28 @@ def _stamp_oai_cache_markers(messages, model):
             messages[idx] = {**messages[idx], 'content': c}
 
 def _stream_with_retry(sess, url, headers, payload, parse_fn):
+    STATS['session'] = sess.name
     _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529}
+    cap = float(getattr(sess, 'max_retry_after', 60.0))
     def _delay(resp, attempt):
         try: ra = float((resp.headers or {}).get("retry-after"))
         except: ra = None
-        return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+        return None if ra and ra > cap else max(0.5, ra or min(30.0, 3.0 * (2 ** attempt)))
     for attempt in range(sess.max_retries + 1):
         streamed = False
         try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+            with requests.post(url, headers=headers, json=payload, stream=sess.stream,
                                timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
+                sess.active_response = r
                 if r.status_code >= 400:
-                    if r.status_code in _RETRYABLE and attempt < sess.max_retries:
-                        d = _delay(r, attempt)
+                    #pathlib.Path(__file__).parent.joinpath('temp','bad_requests.json').write_text(json.dumps({"url":url,"headers":headers,"payload":payload,"t":time.time()},ensure_ascii=False),encoding='utf-8')
+                    d = _delay(r, attempt) if r.status_code in _RETRYABLE and attempt < sess.max_retries else None
+                    if d is not None:
                         print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
                         time.sleep(d); continue
                     try: body = r.text.strip()[:500]
                     except: body = ""
-                    err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
+                    err = f"!!!Error: HTTP {r.status_code}" + (f" (retry-after > {cap:.0f}s)" if d is None and r.status_code in _RETRYABLE and attempt < sess.max_retries else "") + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
                 gen = parse_fn(r)
                 try:
@@ -388,8 +468,8 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     if not e.value and not streamed: raise requests.ConnectionError("empty response")
                     return e.value or []
         except (requests.Timeout, requests.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-            #pathlib.Path(__file__).parent.joinpath('temp','bad_requests.json').write_text(json.dumps({"url":url,"headers":headers,"payload":payload,"err":str(e),"t":time.time()},ensure_ascii=False),encoding='utf-8')
             err = f"!!!Error: {type(e).__name__}: {e}" if str(e) else f"!!!Error: {type(e).__name__}"
+            if getattr(sess, 'should_stop', None) and sess.should_stop(): return []
             if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
@@ -409,7 +489,7 @@ def _openai_stream(sess, messages):
     headers["User-Agent"] = sess.user_agent
     if api_mode == "responses":
         url = auto_make_url(sess.api_base, "responses")
-        payload = {"model": model, "input": _to_responses_input(messages), "stream": sess.stream, 
+        payload = {"model": model, "input": _to_responses_input(messages), "stream": sess.stream,
                    "prompt_cache_key": _RESP_CACHE_KEY, "instructions": sess.system or "You are an Omnipotent Executor.",
                    "client_metadata": {"x-codex-window-id": f"{_RESP_CACHE_KEY}:0","x-codex-installation-id": _RESP_CODEX_KEY},
                    'include': ['reasoning.encrypted_content']}
@@ -429,7 +509,7 @@ def _openai_stream(sess, messages):
     if sess.service_tier: payload["service_tier"] = sess.service_tier
     parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
     return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
-        
+
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
     if api_mode == "responses":
         resp_tools = []
@@ -528,15 +608,22 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        default_context_win = 30000
+        default_context_win = 35000; default_cut_msg_interval = 7
         if 'deepseek' in self.model.lower():
-            default_context_win = 70000; self.cut_msg_interval = 25; self.trim_keep_rate = 0.3
+            default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
         self.context_win = cfg.get('context_win', default_context_win)
+        self.maxlen_multiplier = min(max(self.context_win / default_context_win * 0.75, 1.0), 3.0)
+        self.cut_msg_interval = int(default_cut_msg_interval * self.maxlen_multiplier)
+        self.trim_keep_prefix = max(0, int(cfg.get('trim_keep_prefix', 0) or 0))
         self.history = []; self.lock = threading.Lock(); self.system = ""
         self.name = cfg.get('name', self.model)
-        proxy = cfg.get('proxy'); 
+        self.extra_sys_prompt = cfg.get('extra_sys_prompt', '')
+        if cfg.get('extra_sys_prompt_file'):
+            self.extra_sys_prompt = (self.extra_sys_prompt or '') + open(cfg['extra_sys_prompt_file'] if os.path.isabs(cfg['extra_sys_prompt_file']) else os.path.join(_ROOT, cfg['extra_sys_prompt_file']), encoding='utf-8').read()
+        proxy = cfg.get('proxy');
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.max_retries = max(0, int(cfg.get('max_retries', 4)))
+        self.max_retry_after = float(cfg.get('max_retry_after', 60.0))
         self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 40) if self.stream else (10, 240)
@@ -545,10 +632,11 @@ class BaseSession:
         def _enum(key, valid):
             v = cfg.get(key); v = None if v is None else str(v).strip().lower()
             return v if not v or v in valid else print(f"[WARN] Invalid {key} {v!r}, ignored.")
-        self.reasoning_effort = _enum('reasoning_effort', {'none', 'minimal', 'low', 'medium', 'high', 'xhigh'})
+        self.reasoning_effort = _enum('reasoning_effort', {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'})
         self.service_tier = _enum('service_tier', {'auto', 'default', 'priority', 'flex'})
         self.thinking_type = _enum('thinking_type', {'adaptive', 'enabled', 'disabled'})
         self.thinking_budget_tokens = cfg.get('thinking_budget_tokens')
+        self.omit_thinking = cfg.get('omit_thinking', False)  # Exclude thinking from session history
         mode = str(cfg.get('api_mode', 'chat_completions')).strip().lower().replace('-', '_')
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
@@ -564,7 +652,7 @@ class BaseSession:
                     thinking["budget_tokens"] = self.thinking_budget_tokens; payload["thinking"] = thinking
             else: payload["thinking"] = thinking
         if self.reasoning_effort:
-            effort = {'low': 'low', 'medium': 'medium', 'high': 'high', 'xhigh': 'max'}.get(self.reasoning_effort)
+            effort = {'low': 'low', 'medium': 'medium', 'high': 'high', 'xhigh': 'max', 'max': 'max'}.get(self.reasoning_effort)
             if effort: payload["output_config"] = {"effort": effort}
             else: print(f"[WARN] reasoning_effort {self.reasoning_effort!r} is unsupported for Claude output_config.effort, ignored.")
     def ask(self, prompt):
@@ -635,7 +723,7 @@ def _fix_messages(messages):
         if m.get('role') not in ('user', 'assistant'): continue
         blocks = W(m.get('content', []))
         if merged and m['role'] == merged[-1]['role']:
-            merged[-1]['content'] += [{"type": "text", "text": "\n"}] + blocks
+            merged[-1]['content'] += list(blocks)
         else:
             merged.append({"role": m['role'], "content": list(blocks)})
     while merged and merged[0]['role'] != 'user': merged.pop(0)
@@ -661,6 +749,7 @@ def _fix_messages(messages):
                 else: rest.append(b)
             m['content'] = [got.get(u) or {"type": "tool_result", "tool_use_id": u, "content": "(error)"} for u in prev_uses] + rest
             prev_uses = []
+    for m in merged: m['content'] = [b for b in m['content'] if not (isinstance(b, dict) and b.get('type') == 'text' and not (b.get('text') or '').strip())] or [{"type": "text", "text": "."}]
     return merged
 
 class NativeClaudeSession(BaseSession):
@@ -673,26 +762,29 @@ class NativeClaudeSession(BaseSession):
         self._device_id = uuid.uuid4().hex + uuid.uuid4().hex[:32]
         self.tools = None
         if self.user_agent == self.default_ua: self.user_agent = self.native_ua
+        self.api_key_header = str(cfg.get('api_key_header', 'auto')).strip().lower()
     def raw_ask(self, messages):
         if self.max_tokens is None: self.max_tokens = 8192
         model = self.model
         messages = _fix_messages(messages)
         if 'claude' in model.lower(): messages = _drop_unsigned_thinking(messages)
         messages = _ensure_thinking_blocks(messages, self.model)
-        beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "effort-2025-11-24"]
+        beta_parts = ["claude-code-20250219", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "thinking-token-count-2026-05-13", "context-management-2025-06-27", "prompt-caching-scope-2026-01-05", "mid-conversation-system-2026-04-07", "effort-2025-11-24", "fallback-credit-2026-06-01"]
         if "[1m]" in model.lower():
             beta_parts.insert(1, "context-1m-2025-08-07"); model = model.replace("[1m]", "").replace("[1M]", "")
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01",
             "anthropic-beta": ",".join(beta_parts), "anthropic-dangerous-direct-browser-access": "true",
             "user-agent": self.user_agent, "x-app": "cli"}
         headers.update({"Accept": "application/json", "X-Claude-Code-Session-Id": self._session_id, "X-Stainless-Arch": "x64", "X-Stainless-Lang": "js", "X-Stainless-OS": "Windows", "X-Stainless-Package-Version": "0.94.0", "X-Stainless-Retry-Count": "0", "X-Stainless-Runtime": "node", "X-Stainless-Runtime-Version": "v24.3.0", "X-Stainless-Timeout": "600"})
-        if self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
+        if self.api_key_header == 'x-api-key': headers["x-api-key"] = self.api_key
+        elif self.api_key_header == 'bearer': headers["authorization"] = f"Bearer {self.api_key}"
+        elif self.api_key.startswith("sk-ant-"): headers["x-api-key"] = self.api_key
         else: headers["authorization"] = f"Bearer {self.api_key}"
         payload = {"model": model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
         #if self.fake_cc_system_prompt: payload["max_tokens"] = 64000
         if self.temperature != 1: payload["temperature"] = self.temperature
         self._apply_claude_thinking(payload)
-        payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}; 
+        #payload["context_management"] = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]};
         if self.fake_cc_system_prompt:
             if 'thinking' not in payload: payload["thinking"] = {"type": "adaptive"}
             if 'output_config' not in payload: payload["output_config"] = {"effort": "medium"}
@@ -703,6 +795,7 @@ class NativeClaudeSession(BaseSession):
             payload["tools"] = tools
         else: print("[ERROR] No tools provided for this session.")
         payload['system'] = [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": {"type": "ephemeral"}}]
+        #payload['system'][0]['text'] += f"\nPlatform: {sys.platform}"
         if self.system:
             if self.fake_cc_system_prompt: payload["system"].append({"type": "text", "text": self.system})
             else: payload["system"] = [{"type": "text", "text": self.system}]
@@ -727,7 +820,9 @@ class NativeClaudeSession(BaseSession):
         except StopIteration as e: content_blocks = e.value or []
         if content_blocks and (_injected := _ensure_text_block(content_blocks)): yield _injected
         if content_blocks and not (len(content_blocks) == 1 and content_blocks[0].get("text", "").startswith("!!!Error:")):
-            self.history.append({"role": "assistant", "content": content_blocks})
+            history_blocks = content_blocks
+            if self.omit_thinking: history_blocks = [b for b in content_blocks if b.get("type") != "thinking"]
+            self.history.append({"role": "assistant", "content": history_blocks})
         text_parts = [b["text"] for b in content_blocks if b.get("type") == "text"]
         content = "\n".join(text_parts).strip()
         tool_calls = [MockToolCall(b["name"], b.get("input", {}), id=b.get("id", "")) for b in content_blocks if b.get("type") == "tool_use"]
@@ -740,7 +835,8 @@ class NativeClaudeSession(BaseSession):
             if think_match:
                 thinking = think_match.group(1).strip()
                 content = re.sub(think_pattern, "", content, flags=re.DOTALL)
-        return MockResponse(thinking, content, tool_calls, str(content_blocks))
+        raw = "[" + ",\n".join(repr(b) for b in content_blocks) + "]"
+        return MockResponse(thinking, content, tool_calls, raw)
 
 class NativeOAISession(NativeClaudeSession):
     native_ua = "codex_exec/0.139.0 (Windows 10.0.26200; x86_64) unknown (codex_exec; 0.139.0)"
@@ -760,8 +856,8 @@ def openai_tools_to_claude(tools):
     return result
 
 class MockFunction:
-    def __init__(self, name, arguments): self.name, self.arguments = name, arguments  
-         
+    def __init__(self, name, arguments): self.name, self.arguments = name, arguments
+
 class MockToolCall:
     def __init__(self, name, args, id=''):
         arg_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else (args or '{}')
@@ -769,10 +865,10 @@ class MockToolCall:
 
 class MockResponse:
     def __init__(self, thinking, content, tool_calls, raw, stop_reason='end_turn'):
-        self.thinking = thinking; self.content = content          
+        self.thinking = thinking; self.content = content
         self.tool_calls = tool_calls; self.raw = raw
         self.stop_reason = 'tool_use' if tool_calls else stop_reason
-    def __repr__(self):    
+    def __repr__(self):
         return f"<MockResponse thinking={bool(self.thinking)}, content='{self.content}', tools={bool(self.tool_calls)}>"
 
 class ToolClient:
@@ -846,7 +942,7 @@ Follow these steps to think and act:
             user += str(m['content']) + "\n"
             self.total_cd_tokens += len(user) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
-        user += "=== ASSISTANT ===\n" 
+        user += "=== ASSISTANT ===\n"
         return system + user
 
     def _parse_mixed_response(self, text):
@@ -940,45 +1036,75 @@ def tryparse(json_str):
     return json.loads(json_str)
 
 class MixinSession:
-    """Multi-session fallback with spring-back to primary."""
+    """A Session facade backed by multiple routed transport sessions."""
+    _TRANSPORT_OVERRIDES = frozenset({
+        'stream', 'connect_timeout', 'read_timeout', 'temperature', 'max_tokens',
+        'reasoning_effort', 'service_tier', 'thinking_type',
+        'thinking_budget_tokens', 'omit_thinking', 'proxies', 'verify',
+    })
+    _FACADE_STATE = frozenset({'name', 'history', 'system', 'tools', 'lock'})
+
     def __init__(self, all_sessions, cfg):
-        self._retries, self._base_delay = cfg.get('max_retries', 3), cfg.get('base_delay', 1.5)
+        self._retries = cfg.get('max_retries', 3)
+        self._base_delay = cfg.get('base_delay', 3.0)
         self._spring_sec = cfg.get('spring_back', 300)
-        self._sessions = [all_sessions[i].backend if isinstance(i, int) else 
-                          next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i) for i in cfg.get('llm_nos', [])]
-        is_native = lambda s: 'Native' in s.__class__.__name__
-        groups = {is_native(s) for s in self._sessions}
-        assert len(groups) == 1, f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in self._sessions]}"
-        self.name = '|'.join(s.name for s in self._sessions)
-        import copy; self._sessions = [copy.copy(s) for s in self._sessions]
+        selected = [all_sessions[i].backend if isinstance(i, int) else
+                    next(s.backend for s in all_sessions if type(s) is not dict and s.backend.name == i)
+                    for i in cfg.get('llm_nos', [])]
+        if not selected: raise ValueError('MixinSession: no sessions selected')
+        native_groups = {isinstance(s, NativeClaudeSession) for s in selected}
+        if len(native_groups) != 1:
+            raise ValueError(f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in selected]}")
+
+        self._sessions = [copy.copy(s) for s in selected]
         for s in self._sessions: s.max_retries = 0
-        self._orig_raw_asks = [s.raw_ask for s in self._sessions]
-        self._sessions[0].raw_ask = self._raw_ask
+        self._native = native_groups.pop()
+        self._ask_impl = selected[0].ask.__func__
         self._cur_idx, self._switched_at = 0, 0.0
-    def __getattr__(self, name): return getattr(self._sessions[0], name)
-    _BROADCAST_ATTRS = frozenset({'system', 'tools', 'temperature', 'max_tokens', 'reasoning_effort', 'history', 'stream', 'read_timeout'})
-    def __setattr__(self, name, value):
-        if name in self._BROADCAST_ATTRS:
-            for s in self._sessions:
-                v = openai_tools_to_claude(value) if name == 'tools' and type(s) is NativeClaudeSession else value
-                setattr(s, name, v)
-        else: object.__setattr__(self, name, value)
+
+        primary = self._sessions[0]
+        self.name = '|'.join(s.name for s in self._sessions)
+        self.history = copy.deepcopy(primary.history)
+        self.system = primary.system
+        self.tools = getattr(primary, 'tools', None)
+        self.lock = threading.Lock()
     @property
     def primary(self): return self._sessions[0]
     @property
-    def model(self): return getattr(self._sessions[self._cur_idx], 'model', None)
+    def current(self): return self._sessions[self._cur_idx]
     @property
-    def current_name(self): return getattr(self._sessions[self._cur_idx], 'name', None)
+    def current_name(self): return self.current.name
+    def __getattr__(self, name): return getattr(self.current, name)
+    def __setattr__(self, name, value):
+        sessions = self.__dict__.get('_sessions')
+        if sessions and name in self._TRANSPORT_OVERRIDES:
+            for s in sessions: setattr(s, name, value)
+            return
+        node_owns = sessions and any(
+            name in s.__dict__ or any(name in cls.__dict__ for cls in type(s).__mro__)
+            for s in sessions)
+        if node_owns and name not in self._FACADE_STATE: raise AttributeError(f"MixinSession.{name} is node-specific and read-only")
+        object.__setattr__(self, name, value)
+    def ask(self, prompt):
+        self._pick()  # Select the node before ask() reads its context limits.
+        return self._ask_impl(self, prompt)
+    def make_messages(self, messages): return messages
     def _pick(self):
         if self._cur_idx and time.time() - self._switched_at > self._spring_sec: self._cur_idx = 0
         return self._cur_idx
-    def _raw_ask(self, *args, **kwargs):
+    def _prepare(self, idx, messages):
+        session = self._sessions[idx]
+        session.system = self.system
+        session.tools = openai_tools_to_claude(self.tools) if self.tools and type(session) is NativeClaudeSession else self.tools
+        return messages if self._native else session.make_messages(messages)
+    def raw_ask(self, messages):
         base, n = self._pick(), len(self._sessions)
         test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
         for attempt in range(self._retries + 1):
             idx = (base + attempt) % n
-            gen = self._orig_raw_asks[idx](*args, **kwargs)
-            print(f'[MixinSession] Using session ({self._sessions[idx].name})')
+            session = self._sessions[idx]
+            gen = session.raw_ask(self._prepare(idx, messages))
+            print(f'[MixinSession] Using session ({session.name})')
             last_chunk, return_val, yielded = None, [], False
             try:
                 while True:
@@ -991,17 +1117,18 @@ class MixinSession:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
                 elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
                     self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
-                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self._sessions[self._cur_idx].name})')
+                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self.current.name})')
                 return return_val
             if attempt >= self._retries:
                 yield last_chunk; return return_val
             nxt = (base + attempt + 1) % n
-            if nxt == base:  # full round failed, delay before next
+            if nxt == base:
                 rnd = (attempt + 1) // n
                 delay = min(30, self._base_delay * (1.5 ** rnd))
                 print(f'[MixinSession] {last_chunk[:80]}, round {rnd} exhausted, retry in {delay:.1f}s')
                 time.sleep(delay)
-            else: print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
+            else:
+                print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
@@ -1033,7 +1160,7 @@ class NativeToolClient:
         combined_content = []; resp = None; tool_results = []
         for msg in messages:
             c = msg.get('content', '')
-            if msg['role'] == 'system': 
+            if msg['role'] == 'system':
                 self.set_system(c); continue
             if isinstance(c, str): combined_content.append({"type": "text", "text": c})
             elif isinstance(c, list): combined_content.extend(c)
@@ -1052,10 +1179,11 @@ class NativeToolClient:
         final_content = tool_result_blocks + filtered_content
         if not final_content: final_content = [{"type": "text", "text": "."}]
         merged = {"role": "user", "content": final_content}
-        _write_llm_log('Prompt', json.dumps(merged, ensure_ascii=False, indent=2), self.log_path)
+        prompt_raw = '{"role": "user", "content": [\n' + ",\n".join(json.dumps(b, ensure_ascii=False) for b in final_content) + "]}"
+        _write_llm_log('Prompt', prompt_raw, self.log_path)
         gen = self.backend.ask(merged)
         try:
-            while True: 
+            while True:
                 chunk = next(gen); yield chunk
         except StopIteration as e: resp = e.value
         if resp: _write_llm_log('Response', resp.raw, self.log_path, model=self.backend.model)
@@ -1065,6 +1193,7 @@ class NativeToolClient:
 def resolve_session(cfg_name):
     cfg = reload_mykeys()[0].get(cfg_name)
     if not cfg: raise ValueError(f"Config '{cfg_name}' not in mykey")
+    cfg['_mykey_name'] = cfg_name
     if 'native' in cfg_name: return (NativeClaudeSession if 'claude' in cfg_name else NativeOAISession)(cfg=cfg)
     if 'claude' in cfg_name: return ClaudeSession(cfg=cfg)
     return LLMSession(cfg=cfg) if 'oai' in cfg_name else None
