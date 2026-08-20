@@ -145,8 +145,9 @@ def parse_native_log(path, allow_empty=False):
 
 def _derive_hist_info(history):
     """从 native history 重建 history_info(轮级纪要):真实用户提问 → `[USER]: …`;每条
-    assistant(=一轮) → `[Agent] <summary>`(无 summary 取首行)。与 ga.turn_end_callback /
-    worldline 树同口径。纯函数、不依赖 worldline,供续接 opt-in 恢复工作记忆(见 restore_wm)。"""
+    assistant(=一轮) → 有字才写 `[Agent] …`(`<summary>` 优先,否则全文;无字跳过)。
+    与 ga.turn_end_callback / worldline 同口径;截断延用 [:80]。纯函数、不依赖 worldline,
+    供续接 opt-in 恢复工作记忆(见 restore_wm)。"""
     def _all_text(m):
         c = m.get('content') if isinstance(m, dict) else None
         if isinstance(c, str): return c
@@ -170,10 +171,9 @@ def _derive_hist_info(history):
         elif role == 'assistant':
             txt = re.sub(r'```.*?```|<thinking>.*?</thinking>', '', _all_text(m), flags=re.DOTALL)
             mt = re.search(r'<summary>(.*?)</summary>', txt, re.DOTALL)
-            s = mt.group(1).strip()[:80] if (mt and mt.group(1).strip()) else ''
-            if not s:
-                s = next((ln.strip()[:80] for ln in txt.splitlines() if ln.strip()), '（无摘要）')
-            out.append(f'[Agent] {s}')
+            raw = (mt.group(1) if mt else txt).strip()
+            if raw:
+                out.append('[Agent] ' + raw.replace('\n', '')[:80])
     return out
 
 
@@ -383,7 +383,7 @@ def list_sessions(exclude_pid=None, exclude_log=None, rewind_root=None):
         valid_keys.append(key)
         out.append((f, mtime, preview, rounds))
     _save_rounds_cache(valid_keys)
-    # 【门控·worldline】树感知发现:日志空/缺失但有非空世界线树的会话(回退到起点后日志被
+    # 【门控·worldline】树感知发现:日志存在但为空且有非空世界线树的会话(回退到起点后日志被
     # 清空 → 上面 sz<32 跳过了)。仅当调用方显式传 rewind_root 时启用 → 其他 UI 不传,
     # 行为逐字节不变。只读 tree.json 的 nodes/head(不依赖 worldline 模块)。
     if rewind_root and os.path.isdir(rewind_root):
@@ -399,11 +399,11 @@ def list_sessions(exclude_pid=None, exclude_log=None, rewind_root=None):
             if log_name in have or log_name == exclude_log:
                 continue
             log_path = os.path.join(_LOG_DIR, log_name)
-            try:                                    # 仅收"日志确实空/缺失"的(非空日志已被主循环收录)
+            try:                                    # 仅收"日志确实为空"的(非空日志已被主循环收录)
                 if os.path.getsize(log_path) >= 32:
                     continue
             except OSError:
-                pass                                # 缺失也算
+                continue                            # 日志缺失(如已归档)不作为可续会话展示
             try:
                 with open(os.path.join(rewind_root, key, 'tree.json'), encoding='utf-8') as fh:
                     d = json.load(fh)

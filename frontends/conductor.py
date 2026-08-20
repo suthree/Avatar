@@ -1,14 +1,24 @@
-import os, sys, re, time, json, uuid, queue, asyncio, threading
+import os, sys, re, time, json, uuid, queue, asyncio, threading, argparse, base64, secrets
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _resolve_ga_root() -> str:
+    """External core dir when launched as the bundle's conductor (design 三).
+    Prefer GA_ROOT env (set by the desktop bridge), else derive from own location."""
+    val = (os.environ.get("GA_ROOT", "") or "").strip()
+    if val:
+        root = os.path.abspath(os.path.expanduser(val))
+        if os.path.exists(os.path.join(root, "agentmain.py")):
+            return root
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+ROOT = _resolve_ga_root()
 if ROOT not in sys.path: sys.path.insert(0, ROOT)
 
 from agentmain import GenericAgent
@@ -17,29 +27,84 @@ HOST = "127.0.0.1"
 PORT = 8900
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conductor.html")
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", default=HOST)
+parser.add_argument("--port", type=int, default=PORT)
+parser.add_argument("--key")
+parser.add_argument("--no-browser", action="store_true")
+args = parser.parse_args()
+if args.host not in ("127.0.0.1", "localhost", "::1") and not args.key:
+    parser.error("--key is required for non-loopback listening")
 
-def _desktop_llm_no() -> Optional[int]:
-    """Read the model index the user picked in the desktop UI.
-    Persisted by the bridge at ~/.ga_desktop_settings.json under ui.llmNo.
-    Returns None when unavailable, so callers keep the agent's default model."""
+
+def _settings_doc() -> dict:
     try:
         from pathlib import Path
         doc = json.loads((Path.home() / ".ga_desktop_settings.json").read_text(encoding="utf-8"))
-        no = (doc.get("ui") or {}).get("llmNo")
-        return int(no) if no is not None else None
+        return doc if isinstance(doc, dict) else {}
     except Exception:
-        return None
+        return {}
+
+
+def _conductor_llm_no() -> Optional[int]:
+    """Read the model index bound to the conductor session.
+    Falls back to the legacy desktop default ui.llmNo for existing installs."""
+    doc = _settings_doc()
+    for section in (doc.get("conductor"), doc.get("ui")):
+        if isinstance(section, dict) and section.get("llmNo") is not None:
+            try:
+                return int(section.get("llmNo"))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _client_usable(agent: "GenericAgent") -> bool:
+    return hasattr(getattr(agent, "llmclient", None), "backend")
+
+
+def _fallback_usable_model(agent: "GenericAgent") -> None:
+    for i, client in enumerate(getattr(agent, "llmclients", []) or []):
+        if not hasattr(client, "backend"):
+            continue
+        agent.llm_no = i
+        agent.llmclient = client
+        with suppress(Exception):
+            agent.llmclient.last_tools = ''
+        return
 
 
 def _apply_desktop_model(agent: "GenericAgent") -> None:
-    """Switch a freshly built agent to the desktop-selected model (if any)."""
-    no = _desktop_llm_no()
-    if no is None:
-        return
-    try:
-        agent.next_llm(int(no))
-    except Exception as e:
-        print(f"[conductor] failed to apply desktop model #{no}: {e}", file=sys.stderr)
+    """Make the conductor's session reflect the current desktop config before a task:
+    switch to its bound model if one is set, otherwise still refresh sessions from
+    mykey so live key/model edits (e.g. importing keys) take effect without a restart.
+    next_llm() already reloads internally; the no-bound-model branch must reload too,
+    or a conductor started on an empty/stale mykey would never pick up imported keys."""
+    no = _conductor_llm_no()
+    if no is not None:
+        try:
+            agent.next_llm(int(no))
+        except Exception as e:
+            print(f"[conductor] failed to apply conductor model #{no}: {e}", file=sys.stderr)
+    else:
+        agent.load_llm_sessions()  # mtime-guarded; rebuilds only when mykey changed
+    if not _client_usable(agent):
+        print("[conductor] selected model is unavailable; falling back to first usable model", file=sys.stderr)
+        _fallback_usable_model(agent)
+
+
+def _select_llm(agent: "GenericAgent", llm: Any) -> bool:
+    if llm is None or str(llm).strip() == "": return False
+    q = str(llm).strip()
+    if isinstance(llm, int) or q.isdigit(): agent.next_llm(int(q)); return True
+    q = q.lower(); agent.load_llm_sessions()
+    for i, c in enumerate(agent.llmclients):
+        vals = []
+        for fn in (lambda: agent.get_llm_name(c), lambda: agent.get_llm_name(c, model=True), lambda: c.backend.name, lambda: c.backend.model):
+            try: vals.append(str(fn()).lower())
+            except Exception: pass
+        if any(q in v for v in vals): agent.next_llm(i); return True
+    raise ValueError(f"llm not found: {llm}")
 
 
 @asynccontextmanager
@@ -56,12 +121,26 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Conductor", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+class RemoteAuth:
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        remote = (scope.get("client") or ("",))[0]
+        got = dict(scope.get("headers", [])).get(b"authorization", b"")
+        want = b"Basic " + base64.b64encode(f"conductor:{args.key}".encode())
+        if args.key and remote not in ("127.0.0.1", "::1") and not secrets.compare_digest(got, want):
+            if scope["type"] == "websocket": return await send({"type": "websocket.close", "code": 1008})
+            return await PlainTextResponse("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="Conductor"'})(scope, receive, send)
+        await self.app(scope, receive, send)
+
+app.add_middleware(RemoteAuth)
+
 class ChatIn(BaseModel):
     msg: str
     role: str = "conductor"  # conductor | system | user
 
 class StartSubagentIn(BaseModel):
     prompt: str
+    llm: Any = None
 
 class ApprovalIn(BaseModel):
     prompt: str
@@ -70,6 +149,7 @@ class ApprovalIn(BaseModel):
 class SubagentActionIn(BaseModel):
     action: str = "intervene"  # intervene | abort | kill
     msg: str = ""
+    llm: Any = None
 
 @dataclass
 class SubAgentState:
@@ -141,8 +221,26 @@ async def broadcast(payload: dict):
 
 def push_cards(): schedule_broadcast({"type": "subagents", "items": pool.snapshot()})
 
+FILE_ROOT = os.path.dirname(ROOT)
+FILE_HOME = os.path.join(ROOT, "temp")
+UPLOAD_DIR = os.path.join(FILE_HOME, "uploads")
+
+def file_path(path: str):
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.commonpath((FILE_ROOT, path)) != FILE_ROOT: raise ValueError("path is above file browser root")
+    return path
+
 def add_chat(msg: str, role: str = "conductor", files: list = None, images: list = None):
-    item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user", "files": files or [], "images": images or []}
+    files = list(files or [])
+    known = {x.get("path") for x in files}
+    for ref in re.findall(r"`([^`\n]+)`", msg):
+        for candidate in ([ref] if os.path.isabs(ref) else [os.path.join(FILE_HOME, ref), ref]):
+            try: path = file_path(candidate)
+            except ValueError: continue
+            if os.path.isfile(path):
+                if path not in known: files.append({"ref": ref, "path": path, "name": os.path.basename(path)})
+                break
+    item = {"id": short_id(), "role": role, "msg": msg, "ts": now_ms(), "read": role != "user", "files": files, "images": images or []}
     chat_messages.append(item)
     if len(chat_messages) > 200: del chat_messages[:-200]
     schedule_broadcast({"type": "chat", "item": item})
@@ -215,13 +313,13 @@ class SubagentPool:
                 s.agent.task_queue.put("EXIT")  
                 with self.lock: self.subagents.pop(sid, None)  
             if to_abort: push_cards()
-    def start_subagent(self, prompt: str) -> dict:
+    def start_subagent(self, prompt: str, llm: Any = None) -> dict:
         sid = short_id()
         agent = GenericAgent()
         agent.inc_out = True
         agent.verbose = False
         agent.no_print = True
-        _apply_desktop_model(agent)
+        if not _select_llm(agent, llm): _apply_desktop_model(agent)
         th = start_agent_runner(agent, f"subagent-{sid}")
         state = SubAgentState(id=sid, agent=agent, prompt=prompt, status="running", thread=th)
         with self.lock: self.subagents[sid] = state
@@ -233,10 +331,11 @@ class SubagentPool:
         threading.Thread(target=monitor_display_queue, args=(sid, dq, True), name=f"monitor-{sid}", daemon=True).start()
         push_cards()
         return {"id": sid, "status": "running"}
-    def input_subagent(self, sid: str, msg: str) -> dict:
+    def input_subagent(self, sid: str, msg: str, llm: Any = None) -> dict:
         with self.lock: s = self.subagents.get(sid)
         if not s: return {"error": "subagent not found", "id": sid}
         if s.status == "running": return {"error": "subagent is still running, cannot input/reply. Start a new subagent instead.", "id": sid}
+        _select_llm(s.agent, llm)
         s.prompt = msg
         s.reply = ""
         s.status = "running"
@@ -257,11 +356,14 @@ READMES = {
 Conductor API\tBase: http://{HOST}:{PORT}
 
 POST /chat\tbody: {{"msg": "..."}}\t给用户发消息
-POST /subagent\tbody: {{"prompt": "..."}}\t启动新subagent，返回 {{"id": "xxx"}}
+POST /subagent\tbody: {{"prompt": "..."}}\t启动新subagent，返回 {{"id": "xxx"}}；指定模型加参数llm(数字/名称)
 POST /approval\tbody: {{"prompt": "...", "source": "..."}}\t推一条待批任务到前端(后端不存)，用户同意则直接派发为subagent
+GET /files?path=...\t列举目录（默认temp，最高到GA上一级）
+GET /file?path=...\t下载文件
+POST /file?name=...\t上传到temp/uploads
 POST /subagent/{{id}}\tbody: {{"action": "keyinfo", "msg": "..."}}\t注入key_info（agent下轮可见）
-POST /subagent/{{id}}\tbody: {{"action": "input", "msg": "..."}}\t开新一轮任务（agent停下后追加）
-POST /subagent/{{id}}\tbody: {{"action": "stop"}}\t中断执行但保留（可继续input/reply）
+POST /subagent/{{id}}\tbody: {{"action": "input", "msg": "..."}}\t对subagent输入下一条指令；指定模型加参数llm(数字/名称)
+POST /subagent/{{id}}\tbody: {{"action": "stop"}}\t中断执行但保留（可继续input）
 GET /chat?last=N\t返回最近N条对话（默认20）
 GET /subagent\t返回 {{"items": [...]}}\t查看所有subagent状态
 GET /subagent/{{id}}?max_len=N\t返回单个subagent详情，reply经清洗后截取尾部max_len字（默认5000）。仅在摘要不够判断时使用
@@ -271,7 +373,8 @@ GET /subagent/{{id}}?max_len=N\t返回单个subagent详情，reply经清洗后�
 1. 结合记忆、上下文和用户偏好判断真实需求；不清楚/不能代劳时，用精简checklist一次性问用户。
 2. 判断是新任务还是延续现有任务；优先复用已有stopped subagent（用input追加），只有确实无关的新任务才新建。
 3. 分派前必须POST /chat告知用户：改写后的prompt + 分派方案（新建/复用哪个subagent）。
-4. 执行分派，完成即停。危险操作（改源码/删数据/安全敏感）必须改成先让subagent出方案；你验收后POST /chat请用户确认，确认后才继续执行。""",
+4. 执行分派，完成即停。危险操作（改源码/删数据/安全敏感）必须改成先让subagent出方案；你验收后POST /chat请用户确认，确认后才继续执行。
+5. 建议按照任务建立cwd下子目录并在prompt中要求subagent将文件输出到子目录""",
 "subagent": """\
 subagent完成流程：
 1. 如果是IM采集subagent，按GET /readme/im进行而非本流程
@@ -321,7 +424,8 @@ API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /
 - 改写prompt时严禁添加用户未提及的假设、工具、前提条件。只能精炼/结构化用户原意，不能脑补，只能做很小的改写
 
 原则：
-- 信任subagent足够聪明，不要写具体步骤和容易探测的信息；能自己判断的自己判断，只在真正需要用户决策时打扰。\n
+- 信任subagent足够聪明，不要写具体步骤和容易探测的信息；能自己判断的自己判断，只在真正需要用户决策时打扰。
+- 向用户交付文件时，路径用反引号包裹。\n
 需要处理：
 {summary}"""
 
@@ -355,7 +459,6 @@ API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /
                 return
 
     def _run(self):
-        self.agent = GenericAgent()
         self.agent.inc_out = True
         start_agent_runner(self.agent, "conductor-agent")
         self.started = True
@@ -372,22 +475,35 @@ API: {base}；requests，GET /readme查用法，GET /chat读未读对话，GET /
                     self.inbox.task_done()
                 except Exception:
                     break
+            kind = first.get("type"); others = [e for e in events if e.get("type") != kind]; events = [e for e in events if e.get("type") == kind] or [first]
+            for e in others: self.inbox.put(e)
             try:
                 prompt = self._build_prompt(events)
-                # Follow the desktop-selected model live: re-read before each task
-                # so switching models in the UI takes effect without restarting.
-                _apply_desktop_model(self.agent)
                 dq = self.agent.put_task(prompt, source="conductor")
                 self._drain(dq, events)
-            except Exception as e: print(f"Conductor error: {e}")
+            except Exception as e:
+                print(f"Conductor error: {e}")
+                add_chat(f"⚠ 回复失败：{e}", role="error")
 
-    def start(self): threading.Thread(target=self._run, name="conductor-loop", daemon=True).start()
+    def start(self):
+        self.agent = GenericAgent(); _apply_desktop_model(self.agent)
+        threading.Thread(target=self._run, name="conductor-loop", daemon=True).start()
 
 
 conductor = Conductor()
 
 # ---- IM poller: 探测conductor_im_plugins/下各插件,信号变化→唤醒总管 ----
-IM_DIR, IM_COOLDOWN = os.path.join(os.path.dirname(__file__), "conductor_im_plugins"), 300
+def _resolve_im_dir() -> str:
+    # 方案三: conductor.py itself is bundle-owned, but IM plugins are user/environment
+    # integrations. Prefer the external core's plugins when GA_ROOT points at one; fall back
+    # to the bundle templates/examples when the external core has no plugin directory.
+    external = os.path.join(ROOT, "frontends", "conductor_im_plugins")
+    if os.path.isdir(external):
+        return external
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "conductor_im_plugins")
+
+
+IM_DIR, IM_COOLDOWN = _resolve_im_dir(), 300
 IM_PROMPTS: Dict[str, str] = {}   # source -> 采集prompt（派采集subagent时按需取）
 
 def im_poll_loop():
@@ -419,6 +535,28 @@ def conductor_token_stats():
 
 @app.get("/")
 def index(): return FileResponse(HTML_PATH)
+
+@app.get("/files")
+def files(path: str = FILE_HOME):
+    try: path = file_path(path)
+    except ValueError as e: raise HTTPException(403, str(e))
+    if not os.path.isdir(path): raise HTTPException(404, "directory not found")
+    items = [{"name": x.name, "path": x.path, "dir": x.is_dir(), "size": x.stat().st_size if x.is_file() else None}
+             for x in sorted(os.scandir(path), key=lambda x: (not x.is_dir(), x.name.lower()))]
+    return {"path": path, "parent": path if path == FILE_ROOT else os.path.dirname(path), "items": items}
+
+@app.get("/file")
+def get_file(path: str):
+    try: path = file_path(path)
+    except ValueError as e: raise HTTPException(403, str(e))
+    return FileResponse(path, filename=os.path.basename(path))
+
+@app.post("/file")
+async def put_file(name: str, request: Request):
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    path = os.path.join(UPLOAD_DIR, os.path.basename(name))
+    with open(path, "wb") as f: f.write(await request.body())
+    return {"name": os.path.basename(path), "path": path}
 
 @app.get("/readme")
 def readme(): return PlainTextResponse(READMES["api"])
@@ -452,7 +590,7 @@ INSTR_DISPATCHED = "Task received. I'll handle THIS TASK from here. You MUST to 
 
 @app.post("/subagent")
 def api_start_subagent(body: StartSubagentIn):
-    result = pool.start_subagent(body.prompt)
+    result = pool.start_subagent(body.prompt, body.llm)
     result["instruction"] = INSTR_DISPATCHED
     return result
 
@@ -466,7 +604,7 @@ def api_subagent_action(sid: str, body: SubagentActionIn):
         result["instruction"] = "Received. I'll incorporate this. You MUST to do other task or end your reply."
         return result
     if action in ("input", "reply", "append", "message", "msg"):
-        result = pool.input_subagent(sid, body.msg)
+        result = pool.input_subagent(sid, body.msg, body.llm)
         result["instruction"] = INSTR_DISPATCHED
         return result
     if action in ("abort", "stop"):
@@ -479,14 +617,17 @@ def api_subagent_action(sid: str, body: SubagentActionIn):
 
 @app.get("/chat")
 def api_get_chat(last: int = 20):
+    items = [m.copy() for m in chat_messages[-last:]]
     for m in chat_messages:
         if m.get("role") == "user" and not m.get("read"): m["read"] = True
     schedule_broadcast({"type": "chat_read"})
-    return {"items": chat_messages[-last:]}
+    return {"items": items}
 
 @app.post("/chat")
 def api_chat(body: ChatIn):
-    return add_chat(body.msg, role=body.role)
+    item = add_chat(body.msg, role=body.role)
+    if body.role == "user": conductor.notify({"type": "user_message", "msg": body.msg})
+    return item
 
 @app.post("/approval")
 def api_approval(body: ApprovalIn):
@@ -499,9 +640,12 @@ async def websocket(ws: WebSocket):
     ws_clients.add(ws)
     try:
         running = any(s.status == "running" for s in pool.subagents.values())
-        await ws.send_json({"type": "hello", "subagents": pool.snapshot(), "chat": chat_messages, "log": conductor.log, "running": running})
+        await ws.send_json({"type": "hello", "subagents": pool.snapshot(), "chat": chat_messages, "log": conductor.log, "running": running, "llms": conductor.agent.list_llms(), "llm": conductor.agent.llm_no})
         while True:
             data = await ws.receive_json()
+            if "llm" in data:
+                if type(n := data["llm"]) is int and 0 <= n < len(conductor.agent.list_llms()): conductor.agent.next_llm(n)
+                continue
             msg = (data.get("msg") or "").strip()
             if not msg: continue
             add_chat(msg, role="user", files=data.get("files") or [], images=data.get("images") or [])
@@ -513,7 +657,7 @@ if __name__ == "__main__":
     import uvicorn
     # bridge 自启 conductor 时传 --no-browser:不在用户浏览器里弹一个独立 conductor UI,
     # 用户从桌面版「指挥家」页直接连过来即可。手动跑 conductor.py(没带 flag)保持原行为。
-    if "--no-browser" not in sys.argv:
+    if not args.no_browser:
         import webbrowser, threading
-        threading.Timer(1.0, lambda: webbrowser.open(f"http://{HOST}:{PORT}")).start()
-    uvicorn.run("conductor:app", host=HOST, port=PORT, reload=False)
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+    uvicorn.run(app, host=args.host, port=args.port)

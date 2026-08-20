@@ -65,8 +65,9 @@
 #   proxy           可选。单 session 代理，'http://127.0.0.1:2082' 这种。不填则
 #                   即使全局设置了 proxy 也不走。
 # ─── 容量 / 超时 ─────────────────────────────────────────────────────────────
-#   context_win     默认 24000（NativeClaudeSession 默认 28000）。仅作为历史裁
-#                   剪阈值，不是硬上下文限制。
+#   context_win     默认 30000（DeepSeek 默认 70000）。用于历史裁剪，并联动
+#                   压缩频率和工具结果上限；不是硬上下文限制。
+#   trim_keep_prefix 默认 0。硬删时保留最前 K 条，切点插 "..." 并剥尾部 tool_use。不影响 tag 压缩。
 #   max_retries     默认 1。_openai_stream 遇到 429/408/5xx 的自动重试次数。
 #   connect_timeout 连接超时秒数，默认 5。
 #   read_timeout    流式读取超时秒数，默认 30。
@@ -156,7 +157,6 @@ mixin_config = {
 #     'stream': False,                             # 某些渠道不支持 SSE 流式时改 False
 #     # 'user_agent': 'claude-cli/2.1.113 (external, cli)',
 # }
-
 # ── 1b. Anthropic 官方直连 ──────────────────────────────────────────────────
 #  官方端点，apikey 以 sk-ant- 开头 → 自动切到 x-api-key 鉴权。
 #  真 Anthropic 端点不需要 fake_cc_system_prompt。
@@ -181,12 +181,32 @@ mixin_config = {
 #     # 'reasoning_effort': 'high',
 #     'temperature': 1,                        # float 默认 1.0
 #     'max_tokens': 32768,                     # int 默认 8192；Claude 回复最大 token 数
-#     # 'context_win': 800000,                 # int 默认 28000（NativeClaudeSession）；历史裁剪阈值
+#     # 'context_win': 800000,                 # int 默认 30000；历史裁剪及工具上限参考
 #     # 'stream': True,                        # bool 默认 True；False → 一次性 JSON（CDN 截断 SSE 时用）
 #     # 'max_retries': 3,                      # int 默认 1
 #     # 'connect_timeout': 10,                 # int 秒 默认 5（最小 1）
 #     # 'read_timeout': 180,                   # int 秒 默认 30（最小 5）
 #     # 'fake_cc_system_prompt': False,        # bool 默认 False；真 Anthropic 端点不需开
+# }
+
+# ── 1b′. Anthropic Messages 端点 + 手动指定鉴权头（api_key_header）──────────────
+#  某些中转渠道（如 opencode.ai）提供 Anthropic /v1/messages 端点，但 apikey 非
+#  sk-ant- 前缀。NativeClaudeSession 对非 sk-ant- 的 key 默认发 Authorization: Bearer；
+#  若目标端点只接受 x-api-key（如 opencode.ai 的 /v1/messages 只认 x-api-key，
+#  Bearer 会返回 401 Missing API key），用 api_key_header 手动强制鉴权头。
+#  api_key_header 合法值: 'auto'（默认，按 sk-ant- 前缀自动判断）
+#                        / 'x-api-key'（强制 x-api-key 头）
+#                        / 'bearer'（强制 Authorization: Bearer 头）
+# native_claude_config_opencode = {
+#     'name': 'opencode-deepseek-native',
+#     'apikey': '<your-key>',                  # 非 sk-ant- 前缀
+#     'apibase': 'https://opencode.ai/zen/go/v1',
+#     'model': 'deepseek-v4-flash',
+#     'api_key_header': 'x-api-key',           # ← 强制 x-api-key（否则 auto 发 Bearer→401）
+#     'thinking_type': 'adaptive',
+#     'reasoning_effort': 'low',
+#     'max_retries': 5,
+#     'read_timeout': 180,
 # }
 
 # ── 1c. CRS 反代 Claude Max ─────────────────────────────────────────────────
@@ -250,7 +270,7 @@ mixin_config = {
 #     # 'temperature': 1.0,                            # float 默认 1.0
 #     # 'max_tokens': 8192,                            # int 默认 8192
 #     # 'proxy': 'http://127.0.0.1:2082',              # 可选单 session HTTP 代理
-#     # 'context_win': 16000,                          # int 默认 24000；历史裁剪阈值
+#     # 'context_win': 16000,                          # int 默认 30000；历史裁剪及工具上限参考
 # }
 
 # ── 也可以走 Responses API ──────────────────────────────────────────────────
@@ -311,4 +331,3 @@ mixin_config = {
 #     'secret_key': 'sk-lf-...',
 #     'host': 'https://cloud.langfuse.com',   # 或自托管地址
 # }
-
